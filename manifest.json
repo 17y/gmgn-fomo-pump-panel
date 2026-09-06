@@ -1,0 +1,110 @@
+{
+  "manifest_version": 3,
+  "minimum_chrome_version": "116",
+  "name": "GMGN Fomo Pump Panel",
+  "version": "1.0.0",
+  "description": "把 Fomo/Pump 关注交易以事件方式推送到 GMGN 原生追踪流。",
+  "permissions": [
+    "storage",
+    "webRequest",
+    "declarativeNetRequestWithHostAccess",
+    "sidePanel",
+    "scripting",
+    "clipboardWrite",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "https://gmgn.ai/*",
+    "https://www.gmgn.ai/*",
+    "https://fomo.family/*",
+    "https://prod-api.fomo.family/*",
+    "https://pump.fun/*",
+    "https://frontend-api-v3.pump.fun/*",
+    "https://profile-api.pump.fun/*",
+    "https://*.nats.realtime.pump.fun/*",
+    "https://api.mainnet-beta.solana.com/*",
+    "https://ethereum-rpc.publicnode.com/*",
+    "https://bsc-rpc.publicnode.com/*",
+    "https://rpc-bsc.blockmachine.io/*",
+    "https://bsc.drpc.org/*",
+    "https://mainnet.base.org/*",
+    "https://rpc.mainnet.chain.robinhood.com/*",
+    "https://robinhoodchain.blockscout.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "action": {
+    "default_title": "打开 GMGN Fomo / Pump 侧边栏"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "src/panel.css",
+        "assets/pump.svg"
+      ],
+      "matches": [
+        "https://gmgn.ai/*",
+        "https://www.gmgn.ai/*"
+      ]
+    }
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://fomo.family/*"
+      ],
+      "js": [
+        "src/fomo-alert-topic-main.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://fomo.family/*"
+      ],
+      "js": [
+        "src/fomo-alert-topic.js"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://gmgn.ai/*",
+        "https://www.gmgn.ai/*"
+      ],
+      "js": [
+        "src/trade-identity.js",
+        "src/gmgn-follow-bridge.js",
+        "src/follow-tracker-main.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://gmgn.ai/*",
+        "https://www.gmgn.ai/*"
+      ],
+      "js": [
+        "src/follow-tracker.js"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://gmgn.ai/*",
+        "https://www.gmgn.ai/*"
+      ],
+      "js": [
+        "src/core.js",
+        "src/panel-loader.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

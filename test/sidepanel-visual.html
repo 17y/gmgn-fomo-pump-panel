@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Native Side Panel Visual Fixture</title>
+  <link rel="stylesheet" href="/src/panel.css">
+  <style>html, body { width: 420px; }</style>
+</head>
+<body class="side-panel-page">
+  <aside class="fomo-panel">
+    <header class="fomo-header">
+      <div class="fomo-token-avatar" data-role="token-avatar"></div>
+      <div class="fomo-token-copy">
+        <div class="fomo-token-name" data-role="token-name">GMGN Fomo Pump Panel</div>
+        <div class="fomo-token-symbol" data-role="token-symbol">等待 GMGN Token…</div>
+      </div>
+      <div class="fomo-market">
+        <div class="fomo-market-cap" data-role="market-cap">— MC</div>
+        <div class="fomo-change neutral" data-role="change-24">—</div>
+      </div>
+    </header>
+    <nav class="fomo-tabs" aria-label="Fomo token tabs">
+      <button type="button" class="active" data-tab="holders">Holders</button>
+      <button type="button" data-tab="feed">Feed</button>
+      <button type="button" data-tab="about">About</button>
+    </nav>
+    <main class="fomo-body"><div class="fomo-content" data-role="content"></div></main>
+    <section class="fomo-pump-notice" data-role="pump-notice" aria-live="polite" hidden>
+      <img src="/assets/pump.svg" alt="">
+      <span><strong>Pump 数据未连接</strong><small>打开 Pump 登录后会自动恢复</small></span>
+      <a href="https://pump.fun/?tab=friends" target="_blank" rel="noopener noreferrer">打开 Pump ↗</a>
+    </section>
+    <footer class="fomo-footer">
+      <span data-role="status">Waiting for a GMGN token…</span>
+      <span class="fomo-footer-actions">
+        <label class="fomo-tracking-toggle" title="把当前关注地址的交易推送到 GMGN 追踪；关闭后停止获取">
+          <input type="checkbox" data-role="tracking-toggle" aria-label="关注交易推送到追踪" checked>
+          <span>推送追踪</span><i aria-hidden="true"></i>
+        </label>
+        <button type="button" data-role="refresh">刷新</button>
+        <a data-role="open-fomo" target="_blank" rel="noopener noreferrer" hidden>Open Fomo ↗</a>
+      </span>
+    </footer>
+  </aside>
+  <script>
+    const fixtureData = {
+      metadata: {
+        address: "0x1111111111111111111111111111111111111111",
+        networkId: 56,
+        name: "Demo Panda",
+        symbol: "DEMO",
+        imageUrl: null,
+        description: "Synthetic side panel fixture.",
+        totalSupply: 1000000000,
+        marketCap: 348200,
+        priceUsd: 0.0003482,
+        change24: 1.25,
+        liquidity: 82400,
+        volume24: 191000,
+        socialLinks: {},
+        launchpad: { name: "Demo" }
+      },
+      holders: {
+        totalHolders: 274,
+        fomoPositionValue: 20412.14,
+        fomoPositionCount: 4,
+        pricedPositionCount: 4,
+        fomoTokenAmount: 15_000_000,
+        tokenAmountCount: 2,
+        fomoOwnershipPercent: 1.5,
+        isFomoPositionValueComplete: true,
+        isFomoOwnershipComplete: true,
+        items: [
+          { id: "1", platform: "fomo", tradeId: "trade-1", userId: "user-1", displayName: "Trader Alpha", value: 13445.86, humanAmount: 10_000_000, ownershipPercent: 1, pnl: 5100, costBasis: 8345.86, averageEntryPrice: 0.0002093, comment: "Synthetic holder comment.", likes: 2 },
+          { id: "2", platform: "fomo", tradeId: "trade-2", userId: "user-2", displayName: "Trader Beta", value: 6966.28, humanAmount: 5_000_000, ownershipPercent: 0.5, pnl: 4478, costBasis: 2488.28, averageEntryPrice: 0.0001201, comment: "", likes: 0 },
+          { id: "3", platform: "fomo", tradeId: "trade-3", userId: "user-3", displayName: "Trader Gamma", value: 5032.16, humanAmount: 4_000_000, ownershipPercent: 0.4, pnl: 1220, costBasis: 3812.16, averageEntryPrice: 0.000147, comment: "", likes: 0 },
+          { id: "4", platform: "fomo", tradeId: "trade-4", userId: "user-4", displayName: "Trader Delta", value: 3211.34, humanAmount: 3_000_000, ownershipPercent: 0.3, pnl: 640, costBasis: 2571.34, averageEntryPrice: 0.000156, comment: "", likes: 0 }
+        ]
+      },
+      feed: [
+        { id: "f1", type: "swap_buy", createdAt: new Date().toISOString(), displayName: "Trader Alpha", usdAmount: 1400, marketCap: 331500 }
+      ]
+    };
+    const pumpItems = [
+      { id: "pump-1", platform: "pump", walletAddress: "0x3333333333333333333333333333333333333333", displayName: "Pump Caller", value: 10218.2, humanAmount: 8_000_000, ownershipPercent: 0.8, pnl: 3632, pnlPercent: 55.4, costBasis: 6586.2, averageEntryPrice: 0.000117, comment: "Pump callout with current position data.", likes: 0 }
+    ];
+    globalThis.copiedWalletAddress = "";
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText(value) { globalThis.copiedWalletAddress = value; return Promise.resolve(); } }
+    });
+    let queryCount = 0;
+    globalThis.chrome = {
+      runtime: {
+        lastError: null,
+        getURL(path) { return `/${path}`; },
+        connect() {
+          return {
+            postMessage() {},
+            onDisconnect: { addListener() {} }
+          };
+        },
+        sendMessage(message, callback) {
+          if (message.type === "queryFomoToken") {
+            queryCount += 1;
+            const data = structuredClone(fixtureData);
+            data.metadata.marketCap += queryCount * 1000;
+            callback({ ok: true, data });
+          } else if (message.type === "queryPumpHolders") {
+            setTimeout(() => callback({ ok: true, items: structuredClone(pumpItems) }), 240);
+          } else if (message.type === "getFollowedTradeSources") {
+            callback({ ok: true, sources: { pump: { ok: false, error: "PUMP_SESSION_REQUIRED" } } });
+          } else if (message.type === "getFollowedTradesEnabled") {
+            callback({ ok: true, enabled: true });
+          } else if (message.type === "setFollowedTradesEnabled") {
+            callback({ ok: true, enabled: message.enabled });
+          } else if (message.type === "resolveFomoHolderAddress") {
+            callback({ ok: true, address: "0x2222222222222222222222222222222222222222" });
+          } else callback({ ok: true });
+        },
+        onMessage: { addListener() {} }
+      },
+      tabs: {
+        query() {
+          return Promise.resolve([{ url: "https://gmgn.ai/bsc/token/0x1111111111111111111111111111111111111111" }]);
+        },
+        onActivated: { addListener() {} },
+        onUpdated: { addListener() {} }
+      }
+    };
+  </script>
+  <script src="/src/core.js"></script>
+  <script src="/src/pump-api.js"></script>
+  <script src="/src/sidepanel.js"></script>
+</body>
+</html>

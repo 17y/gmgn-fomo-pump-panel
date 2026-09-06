@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GMGN Fomo Pump Panel Visual Fixture</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: #0b0e11; color: #8d96a0; font: 14px Arial, sans-serif; }
+    .gmgn-top { height: 58px; border-bottom: 1px solid #242a30; background: #11161a; }
+    .gmgn-page { display: grid; grid-template-columns: 260px 1fr 330px; height: calc(100vh - 58px); }
+    .gmgn-side, .gmgn-order { border-right: 1px solid #20262b; background: #0e1317; }
+    .gmgn-order { border-right: 0; border-left: 1px solid #20262b; }
+    .gmgn-chart { position: relative; overflow: hidden; padding: 24px; }
+    .gmgn-title { color: #e6edf3; font-size: 20px; }
+    .gmgn-lines { position: absolute; inset: 90px 30px 50px; opacity: .35; background: repeating-linear-gradient(0deg, transparent 0 90px, #30404a 91px), repeating-linear-gradient(90deg, transparent 0 140px, #30404a 141px); }
+  </style>
+</head>
+<body>
+  <div class="gmgn-top"></div>
+  <div class="gmgn-page">
+    <aside class="gmgn-side"></aside>
+    <main class="gmgn-chart"><div class="gmgn-title">Demo Panda / BNB</div><div class="gmgn-lines"></div></main>
+    <aside class="gmgn-order"></aside>
+  </div>
+  <script>
+    history.replaceState({}, "", "/bsc/token/0x1111111111111111111111111111111111111111");
+    const fixtureData = {
+      metadata: {
+        address: "0x1111111111111111111111111111111111111111",
+        networkId: 56,
+        name: "Demo Panda",
+        symbol: "DEMO",
+        imageUrl: null,
+        description: "Synthetic fixture data used only to verify the extension layout.",
+        totalSupply: 1000000000,
+        createdAt: 1781643950,
+        marketCap: 348200,
+        priceUsd: 0.0003482,
+        change24: 16.0725,
+        liquidity: 82400,
+        volume24: 191000,
+        socialLinks: { website: "https://example.com", twitter: "https://x.com/example" },
+        launchpad: { name: "Four.meme", iconUrl: null }
+      },
+      holders: {
+        totalHolders: 274,
+        fomoPositionValue: 34490.91,
+        fomoPositionCount: 5,
+        pricedPositionCount: 5,
+        fomoTokenAmount: 99_000_000,
+        tokenAmountCount: 5,
+        fomoOwnershipPercent: 9.9,
+        isFomoPositionValueComplete: true,
+        isFomoOwnershipComplete: true,
+        items: [
+          { id: "1", platform: "fomo", tradeId: "trade-1", userId: "user-1", displayName: "Trader Alpha", profilePictureLink: "", value: 13445.86, humanAmount: 30_000_000, ownershipPercent: 3, pnl: 5100, costBasis: 8345.86, averageEntryPrice: 0.0002093, comment: "Synthetic holder comment for visual layout testing.", likes: 19 },
+          { id: "2", platform: "fomo", tradeId: "trade-2", userId: "user-2", displayName: "Trader Beta", profilePictureLink: "", value: 6966.28, humanAmount: 25_000_000, ownershipPercent: 2.5, pnl: 4478, costBasis: 2488.28, averageEntryPrice: 0.0001201, comment: "", likes: 0 },
+          { id: "3", platform: "fomo", tradeId: "trade-3", userId: "user-3", displayName: "Trader Gamma", profilePictureLink: "", value: 4909.10, humanAmount: 20_000_000, ownershipPercent: 2, pnl: 2698, costBasis: 2211.10, averageEntryPrice: 0.0001539, comment: "This is synthetic content.\n\nThe text is intentionally long enough to verify truncation and the Read more control without including content from a real user.", likes: 5 },
+          { id: "4", platform: "fomo", tradeId: "trade-4", userId: "user-4", displayName: "Trader Delta", profilePictureLink: "", value: 4634.13, humanAmount: 15_000_000, ownershipPercent: 1.5, pnl: 4366, costBasis: 268.13, averageEntryPrice: 0.0000193, comment: "Synthetic short comment.", likes: 17 },
+          { id: "5", platform: "fomo", tradeId: "trade-5", userId: "user-5", displayName: "Trader Epsilon", profilePictureLink: "", value: 4535.54, humanAmount: 9_000_000, ownershipPercent: 0.9, pnl: 76, costBasis: 4459.54, averageEntryPrice: 0.0003308, comment: "", likes: 0 }
+        ]
+      },
+      feed: [
+        { id: "f1", type: "swap_sell", createdAt: new Date(Date.now() - 120000).toISOString(), displayName: "Trader Alpha", profilePictureLink: "", usdAmount: 1000, marketCap: 313800 },
+        { id: "f2", type: "swap_buy", createdAt: new Date(Date.now() - 150000).toISOString(), displayName: "Trader Beta", profilePictureLink: "", usdAmount: 1400, marketCap: 331500 },
+        { id: "f3", type: "transfer_in", createdAt: new Date(Date.now() - 180000).toISOString(), displayName: "Trader Gamma", profilePictureLink: "", usdAmount: 950, marketCap: 325000 },
+        { id: "f4", type: "swap_buy", createdAt: new Date(Date.now() - 240000).toISOString(), displayName: "Trader Delta", profilePictureLink: "", usdAmount: 2600, marketCap: 298400 }
+      ]
+    };
+    const pumpItems = [
+      { id: "pump-1", platform: "pump", walletAddress: "0x3333333333333333333333333333333333333333", displayName: "Pump Caller", profilePictureLink: "", value: 10218.2, humanAmount: 8_000_000, ownershipPercent: 0.8, pnl: 3632, pnlPercent: 55.4, costBasis: 6586.2, averageEntryPrice: 0.000117, comment: "Pump callout with current position data.", likes: 0 }
+    ];
+    globalThis.copiedWalletAddress = "";
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText(value) { globalThis.copiedWalletAddress = value; return Promise.resolve(); } }
+    });
+    globalThis.chrome = {
+      runtime: {
+        lastError: null,
+        getURL(path) { return `${location.origin}/${path}`; },
+        sendMessage(message, callback) {
+          if (message.type === "queryFomoToken") {
+            setTimeout(() => callback({ ok: true, data: structuredClone(fixtureData) }), 120);
+          } else if (message.type === "queryPumpHolders") {
+            setTimeout(() => callback({ ok: true, items: structuredClone(pumpItems) }), 360);
+          } else if (message.type === "getFollowedTradesEnabled") {
+            callback({ ok: true, enabled: true });
+          } else if (message.type === "setFollowedTradesEnabled") {
+            callback({ ok: true, enabled: message.enabled });
+          } else if (message.type === "resolveFomoHolderAddress") {
+            callback({ ok: true, address: "0x2222222222222222222222222222222222222222" });
+          } else callback({ ok: true });
+        },
+        onMessage: { addListener() {} }
+      },
+      storage: {
+        local: {
+          get(_key, callback) { callback({}); },
+          set() {}
+        }
+      }
+    };
+  </script>
+  <script src="/src/core.js"></script>
+  <script src="/src/pump-api.js"></script>
+  <script src="/src/content.js"></script>
+  <script src="/src/content.js"></script>
+</body>
+</html>
