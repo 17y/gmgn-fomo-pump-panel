@@ -48,6 +48,8 @@ const PUMP_IDENTITY_REFRESH_MS = 60_000;
 const PUMP_PROFILE_GRACE_WAIT_MS = 250;
 const PUMP_PROFILE_FALLBACK_WAIT_MS = 4_000;
 const PUMP_PROFILE_CONCURRENCY = 4;
+const PUMP_PROFILE_POLL_LIMIT = 20;
+const PUMP_ALERT_USER_CACHE_MS = 5 * 60_000;
 const PUMP_NATS_CONFIG_CACHE_MS = 60 * 60_000;
 const PUMP_NATS_WALLET_DEBOUNCE_MS = 250;
 const PUMP_NATS_INDEX_RETRY_DELAYS_MS = Object.freeze([2_000, 5_000]);
@@ -149,6 +151,10 @@ const pumpPresenceAuth = {
   backgroundAttemptAt: 0, backgroundError: "", backgroundSuccessAt: 0,
   pageAttemptAt: 0, pageError: "", pageSuccessAt: 0, lastSuccessTransport: "",
 };
+const pumpAlertUserCache = new Map();
+const pumpAlertUserRequests = new Map();
+let pumpProfilePollCursor = 0;
+let pumpProfileFollowingSnapshot = null;
 let pumpFollowingSnapshot = null;
 let holderFollowSnapshot = null;
 let pumpProfileTradesSnapshot = null;
@@ -372,6 +378,7 @@ async function persistPumpIdentity(identity) {
 function resetPumpAccountCaches() {
   stopPumpNatsSubscriptions();
   pumpFollowingSnapshot = null;
+  pumpProfileFollowingSnapshot = null;
   holderFollowSnapshot = null;
   pumpProfileTradesSnapshot = null;
   followedTradesHistory.pump = [];
@@ -1804,6 +1811,7 @@ function stopPumpNatsSubscriptions() {
   pumpAlertsReconcileRequest = null;
   pumpAlertsReconcileAt = 0;
   pumpAlertsStartedAt = 0;
+  pumpProfilePollCursor = 0;
   pumpAlertsReconcileError = "";
   pumpSubscriptionRequest = null;
   pumpSubscriptionRetryCount = 0;
@@ -2046,6 +2054,45 @@ async function queryFomoFollowedTrades(allowSessionRefresh = true, force = false
   }
 }
 
+// Alerts identify EVM traders by their Pump/Solana profile address. Resolve that
+// identity from Pump itself; never pass a profile address off as an EVM wallet.
+async function getPumpAlertUser(profileAddress) {
+  const cached = pumpAlertUserCache.get(profileAddress);
+  if (cached && Date.now() - cached.cachedAt < PUMP_ALERT_USER_CACHE_MS) return cached.payload;
+  if (pumpAlertUserRequests.has(profileAddress)) return pumpAlertUserRequests.get(profileAddress);
+  const request = fetchPublicJson(GmgnPumpApi.buildUserRequest(profileAddress)).then((payload) => {
+    setBoundedCache(pumpAlertUserCache, profileAddress, { payload, cachedAt: Date.now() }, PUMP_ALERT_USER_CACHE_MS, 256);
+    return payload;
+  }).finally(() => pumpAlertUserRequests.delete(profileAddress));
+  pumpAlertUserRequests.set(profileAddress, request);
+  return request;
+}
+
+async function resolvePumpAlertWallet(row) {
+  const core = GmgnFomoCore;
+  const rawChain = row?.chainId ?? row?.coin?.chainId;
+  const networkId = Number(rawChain) || core.TOKEN_NETWORK_IDS[rawChain];
+  if (networkId === core.TOKEN_NETWORK_IDS.sol || !Object.values(core.TOKEN_NETWORK_IDS).includes(networkId)) return row;
+  const wallet = row?.walletAddress ?? row?.author?.walletAddress;
+  if (core.normalizeWalletAddress(wallet, networkId)) return row;
+  const profileAddress = core.normalizeWalletAddress(wallet, core.TOKEN_NETWORK_IDS.sol);
+  if (!profileAddress) return row;
+  const user = await getPumpAlertUser(profileAddress);
+  if (user?.canonical_svm_wallet !== profileAddress
+    || (row?.author?.userId && user?.userId !== row.author.userId)) return row;
+  const evmWallet = core.normalizeWalletAddress(user?.canonical_evm_wallet, networkId);
+  if (!evmWallet) return row;
+  return { ...row, walletAddress: evmWallet,
+    author: { ...row.author, walletAddress: evmWallet } };
+}
+
+async function normalizePumpAlertPage(payload) {
+  const rows = Array.isArray(payload?.items) ? payload.items : [];
+  const resolved = await mapSettledWithConcurrency(rows, PUMP_PROFILE_CONCURRENCY, resolvePumpAlertWallet);
+  return GmgnPumpApi.sanitizeFollowedTrades({ ...payload,
+    items: resolved.map((result, index) => result.status === "fulfilled" ? result.value : rows[index]) });
+}
+
 async function fetchPumpFollowedTradePages(fetchPage, firstPayload = null, maxPages = GmgnPumpApi.FOLLOWED_TRADES_MAX_PAGES) {
   const items = [];
   const seenCursors = new Set();
@@ -2055,7 +2102,7 @@ async function fetchPumpFollowedTradePages(fetchPage, firstPayload = null, maxPa
     if (!payload) {
       payload = await fetchPage(GmgnPumpApi.buildFollowedTradesRequest(cursor));
     }
-    items.push(...GmgnPumpApi.sanitizeFollowedTrades(payload));
+    items.push(...await normalizePumpAlertPage(payload));
     const nextCursor = GmgnPumpApi.followedTradesNextCursor(payload);
     if (!nextCursor || seenCursors.has(nextCursor)) break;
     seenCursors.add(nextCursor);
@@ -2110,9 +2157,9 @@ function reconcilePumpAlerts(transport = "alerts-rest-reconnect") {
   const generation = pumpAlertsPresenceGeneration;
   if (!pumpAlertsStartedAt) pumpAlertsStartedAt = Date.now();
   const request = (async () => {
+    // Keep Alerts delivery independent of slower profile indexing/RPC checks.
+    const profileCheck = reconcilePumpProfileGaps(generation).catch(() => {});
     try {
-      // Website first-page Alerts only: no profiles, wallet enumeration, RPC,
-      // metadata enrichment or additional NATS subscriptions on this path.
       const items = await queryPumpAlertTrades(true);
       if (!followedTradesEnabled || generation !== pumpAlertsPresenceGeneration) return;
       await hydrateFollowedTradesHistory();
@@ -2127,6 +2174,7 @@ function reconcilePumpAlerts(transport = "alerts-rest-reconnect") {
       pumpAlertsReconcileError = diagnosticError(error?.message) || "PUMP_ALERTS_RECONCILE_FAILED";
       recordTradeSourceEvent("pump-rest-error", { error: pumpAlertsReconcileError, transport });
     } finally {
+      await profileCheck;
       if (pumpAlertsReconcileRequest === request) {
         pumpAlertsReconcileRequest = null;
         pumpAlertsReconcileAt = Date.now();
@@ -2136,6 +2184,50 @@ function reconcilePumpAlerts(transport = "alerts-rest-reconnect") {
   })();
   pumpAlertsReconcileRequest = request;
   return request;
+}
+
+async function reconcilePumpProfileGaps(generation) {
+  const active = () => followedTradesEnabled && hasFollowedTradeConsumers()
+    && generation === pumpAlertsPresenceGeneration;
+  if (!active()) return;
+  const startedAt = pumpAlertsStartedAt;
+  const identity = await queryPumpIdentity();
+  if (!active()) return;
+  if (!pumpProfileFollowingSnapshot || pumpProfileFollowingSnapshot.viewerWallet !== identity.viewerWallet
+    || Date.now() - pumpProfileFollowingSnapshot.cachedAt >= PUMP_FOLLOWING_CACHE_MS) {
+    const payload = await fetchPublicJson(GmgnPumpApi.buildFollowingRequest(identity.viewerWallet));
+    if (!active()) return;
+    pumpProfileFollowingSnapshot = { viewerWallet: identity.viewerWallet, cachedAt: Date.now(),
+      items: GmgnPumpApi.sanitizeFollowing(payload) };
+  }
+  const following = pumpProfileFollowingSnapshot.items;
+  if (!active() || !following.length) return;
+  // A bounded rotating slice avoids an unbounded burst for large follow lists.
+  const count = Math.min(following.length, PUMP_PROFILE_POLL_LIMIT);
+  const selected = Array.from({ length: count }, (_, i) => following[(pumpProfilePollCursor + i) % following.length]);
+  pumpProfilePollCursor = (pumpProfilePollCursor + count) % following.length;
+  await mapSettledWithConcurrency(selected, PUMP_PROFILE_CONCURRENCY, async (entry) => {
+    if (!active()) return;
+    const user = await getPumpAlertUser(entry.address);
+    if (!active() || user?.canonical_svm_wallet !== entry.address
+      || (entry.userId && user?.userId !== entry.userId)) return;
+    const author = GmgnPumpApi.withUserWallets(entry, user);
+    if (!author.evmAddress) return;
+    const payload = await fetchPublicJson(GmgnPumpApi.buildProfileTransactionsRequest(entry.address));
+    if (!active()) return;
+    const groups = GmgnPumpApi.profileTransferGroups(payload, author, "evm").filter((group) => (
+      group.networkId !== GmgnFomoCore.TOKEN_NETWORK_IDS.sol
+      && group.createdAt >= startedAt && Date.now() - group.createdAt < 60_000
+      && group.createdAt <= Date.now() + 5_000
+    ));
+    if (!groups.length) return;
+    const items = (await resolvePumpEvmProfileGroups(groups)).filter((item) => (
+      item.sourceVerification === GmgnPumpApi.PUMP_CHAIN_RPC_VERIFICATION
+      && item.usdAmount >= GmgnPumpApi.FOLLOWED_TRADES_MIN_USD
+    ));
+    if (!active()) return;
+    await publishPumpCollectedItems(items, "profile-rpc-reconcile", GmgnPumpApi.PUMP_CHAIN_RPC_VERIFICATION, generation);
+  });
 }
 
 function isPumpPresencePost(request) {
@@ -2262,7 +2354,7 @@ async function queryPumpFollowing(identity, force = false) {
   const userResults = await mapSettledWithConcurrency(
     baseItems,
     PUMP_PROFILE_CONCURRENCY,
-    (entry) => fetchPublicJson(GmgnPumpApi.buildUserRequest(entry.userId || entry.address)),
+    (entry) => getPumpAlertUser(entry.address),
   );
   const items = baseItems.map((entry, index) => (
     userResults[index]?.status === "fulfilled"
@@ -2461,6 +2553,7 @@ async function mutatePumpHolderFollow(userId, walletAddress, shouldFollow) {
     cachedAt: Date.now(),
     items,
   };
+  pumpProfileFollowingSnapshot = null;
   pumpProfileTradesSnapshot = pumpProfileTradesSnapshot && {
     ...pumpProfileTradesSnapshot,
     items: filterUnfollowedTrades(pumpProfileTradesSnapshot.items),
@@ -3599,6 +3692,12 @@ function broadcastGmgnFollowTradeEvents(items, transport) {
   return gmgnTradeDelivery.publish(items, transport);
 }
 
+// GMGN's page supplies missing token metadata through its own market API.
+// The worker only freezes fields present on the incoming live Pump event.
+function broadcastPumpLiveTrades(items, transport) {
+  broadcastGmgnFollowTradeEvents(GmgnPumpApi.withRealtimeMarketSnapshots(items), transport);
+}
+
 function broadcastGmgnFollowTradeMetadata(items) {
   if (followedTradesEnabled) gmgnTradeDelivery.metadata(items);
 }
@@ -3730,9 +3829,9 @@ async function publishPumpCollectedItems(items, transport, sourceVerification, g
   if (!acceptedItems.length) return;
   rememberObservedPumpItems(acceptedItems);
   rememberFollowedTrades("pump", acceptedItems);
-  if ([GmgnPumpApi.PUMP_ALERTS_NATS_VERIFICATION, GmgnPumpApi.PUMP_ALERTS_REST_VERIFICATION]
-    .includes(sourceVerification)) {
-    broadcastGmgnFollowTradeEvents(acceptedItems, transport);
+  if ([GmgnPumpApi.PUMP_ALERTS_NATS_VERIFICATION, GmgnPumpApi.PUMP_ALERTS_REST_VERIFICATION,
+    GmgnPumpApi.PUMP_CHAIN_RPC_VERIFICATION].includes(sourceVerification)) {
+    broadcastPumpLiveTrades(acceptedItems, transport, generation);
   }
   // Event-only GMGN consumers do not need a full snapshot. Building one also
   // invokes legacy metadata enrichment over historical tokens.
@@ -4561,7 +4660,7 @@ function ingestPumpNatsAlertEvent(event) {
   const generation = pumpAlertsPresenceGeneration;
   getFollowedTradesEnabled().then((enabled) => {
     if (enabled && generation === pumpAlertsPresenceGeneration) {
-      broadcastGmgnFollowTradeEvents(filterUnfollowedTrades([item]), "alerts-nats");
+      broadcastPumpLiveTrades(filterUnfollowedTrades([item]), "alerts-nats", generation);
     }
   }).catch(() => {});
   pumpNatsTradeBatch = [item, ...pumpNatsTradeBatch].slice(0, 50);
@@ -4611,9 +4710,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       sendResponse({ ok: true, ignored: true });
       return false;
     }
-    const accepted = ingestPumpNatsAlertEvent(message.event);
-    sendResponse({ ok: true, accepted });
-    return false;
+    const generation = pumpAlertsPresenceGeneration;
+    resolvePumpAlertWallet(message.event).then((event) => {
+      const accepted = generation === pumpAlertsPresenceGeneration && followedTradesEnabled
+        && ingestPumpNatsAlertEvent(event);
+      sendResponse({ ok: true, accepted });
+    }).catch(() => sendResponse({ ok: true, accepted: false }));
+    return true;
   }
 
   if (message?.type === "pumpNatsWalletActivity") {

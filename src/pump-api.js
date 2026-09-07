@@ -1172,7 +1172,7 @@
         priceUsdAtTrade: core.finiteNumber(
           trade.priceUsdAtTrade ?? trade.tokenPriceUsdAtTrade ?? trade.priceUsd,
         ),
-        totalSupply: totalSupplyAtTrade,
+        totalSupply: totalSupplyAtTrade ?? coinTotalSupply(coin) ?? coinTotalSupply(row),
         totalSupplyAtTrade,
         marketCap: marketCapAtTrade ?? metadataMarketCap,
         marketCapAtTrade,
@@ -1194,7 +1194,13 @@
     const author = event.author && typeof event.author === "object" ? event.author : null;
     const coin = event.coin && typeof event.coin === "object" ? event.coin : null;
     if (!trade || !author || !coin) return reject("missing-trade-author-coin");
-    if (coin.chainId !== SOLANA_NETWORK_ID) return reject("unsupported-chain");
+    const networkId = typeof coin.chainId === "number" || typeof coin.chainId === "string"
+      ? Number(coin.chainId)
+      : null;
+    if (!Object.values(core.TOKEN_NETWORK_IDS).includes(networkId)) return reject("unsupported-chain");
+    // Validate against the declared chain before the REST parser infers Solana from a mint.
+    const tokenAddress = core.normalizeWalletAddress(coin.mint, networkId);
+    if (!tokenAddress) return reject("invalid-trade-fields");
     const minimum = core.finiteNumber(minTradeAmountUsd);
     const amountUsd = core.finiteNumber(trade.amountUsd);
     if (minimum !== null && amountUsd === null) return reject("missing-usd-amount");
@@ -1203,8 +1209,10 @@
       kind: "trade",
       createdAt: event.createdAt,
       walletAddress: author.walletAddress,
-      coinMint: coin.mint,
-      chainId: coin.chainId,
+      coinMint: tokenAddress,
+      chainId: networkId,
+      coin,
+      marketCap: event.marketCap,
       coinImage: coin.imageUri,
       symbol: coin.symbol,
       author: {
@@ -1215,6 +1223,7 @@
         isVerified: author.isVerified,
       },
       trade: {
+        ...trade,
         tx: trade.tx,
         isBuy: trade.isBuy,
         timestamp: event.createdAt,

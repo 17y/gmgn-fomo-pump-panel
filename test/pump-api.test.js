@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const api = require("../src/pump-api");
+const core = require("../src/core");
 
 const evmParams = {
   address: "0x1111111111111111111111111111111111111111",
@@ -500,7 +501,7 @@ test("Pump 官方 NATS trade 事件直接规范化并严格应用实时过滤", 
     [{ id: "" }, "missing-id"],
     [{ stub: {} }, "stub"],
     [{ author: null }, "missing-trade-author-coin"],
-    [{ coin: { ...event.coin, chainId: String(solanaParams.networkId) } }, "unsupported-chain"],
+    [{ coin: { ...event.coin, chainId: 999999 } }, "unsupported-chain"],
     [{ trade: { ...event.trade, amountUsd: null } }, "missing-usd-amount"],
     [{ trade: { ...event.trade, amountUsd: 9.99 } }, "below-minimum-usd"],
     [{ trade: { ...event.trade, isBuy: null } }, "invalid-trade-fields"],
@@ -1202,4 +1203,58 @@ test("EVM Token ticker 拒绝空值、控制字符、错误 offset、padding 与
   assert.equal(api.decodeEvmTokenSymbol(invalidPadding), "");
   assert.equal(api.decodeEvmTokenSymbol(`0x${"ff".repeat(32)}`), "");
   assert.equal(api.decodeEvmTokenSymbol("0x1234"), "");
+});
+
+
+for (const [chain, networkId] of Object.entries(core.TOKEN_NETWORK_IDS)) {
+  test(`Pump NATS ${chain} 买卖支持数字和字符串链 ID，并与 REST 身份一致`, () => {
+    const solana = chain === "sol";
+    const wallet = solana ? "21rgbFW6sujQovCw3qt6R2EdE97Yzzvk8sSc37Bb72Cm" : `0x${"Ab".repeat(20)}`;
+    const mint = solana ? solanaParams.address : `0x${"Cd".repeat(20)}`;
+    const tx = solana ? "live-solana-signature" : `0x${"Ef".repeat(32)}`;
+    for (const isBuy of [true, false]) {
+      for (const chainId of [networkId, String(networkId)]) {
+        const event = { id: `live-${chain}-${isBuy}`, kind: "trade", createdAt: "2026-09-06T08:30:00.000Z",
+          author: { userId: "friend", userName: "Friend", walletAddress: wallet },
+          coin: { mint, chainId, symbol: "LIVE" },
+          trade: { tx, isBuy, baseAmount: 100, amountUsd: 25, priceUsd: 0.25 } };
+        const item = api.sanitizeRealtimeAlertTrade(event);
+        assert.ok(item);
+        assert.equal(item.networkId, networkId);
+        assert.equal(item.transactionHash, solana ? tx : tx.toLowerCase());
+        assert.equal(item.walletAddress, solana ? wallet : wallet.toLowerCase());
+        assert.equal(item.tokenAddress, solana ? mint : mint.toLowerCase());
+        assert.equal(item.sourceVerification, api.PUMP_ALERTS_NATS_VERIFICATION);
+        const [rest] = api.sanitizeFollowedTrades({ items: [{ ...event, walletAddress: wallet, coinMint: mint }] });
+        assert.equal(item.id, rest.id);
+        assert.equal(api.sanitizeRealtimeAlertTrade({ ...event, coin: { ...event.coin,
+          mint: solana ? `0x${"ab".repeat(20)}` : solanaParams.address } }), null);
+        if (!solana) {
+          assert.equal(api.sanitizeRealtimeAlertTrade({ ...event, author: { ...event.author, walletAddress: "invalid" } }), null);
+          assert.equal(api.sanitizeRealtimeAlertTrade({ ...event, trade: { ...event.trade, tx: "invalid" } }), null);
+        }
+      }
+    }
+  });
+}
+
+test('Pump REST 与 NATS 保留供应量及实时市值，原始整数按 decimals 转换', () => {
+  const row = require('./fixtures/pump-evm-alert.json');
+  const user = require('./fixtures/pump-evm-alert-user.json');
+  const coin = { mint: row.coinMint, chainId: row.chainId, symbol: row.symbol,
+    total_supply_str: '1372742700000000000000000000', decimals: 18, marketCap: 690877.7783100586 };
+  const author = { ...row.author, walletAddress: user.canonical_evm_wallet };
+  const [rest] = api.sanitizeFollowedTrades({ items: [{ ...row, coin, author, walletAddress: author.walletAddress }] });
+  const nats = api.sanitizeRealtimeAlertTrade({ ...row, id: 'marketcap-fields', coin, author });
+  for (const item of [rest, nats]) {
+    assert.equal(item.totalSupply, 1_372_742_700);
+    assert.equal(item.marketCap, coin.marketCap);
+    assert.equal(item.totalSupplyAtTrade, null);
+    assert.equal(item.marketCapAtTrade, null);
+    assert.equal(item.priceUsdAtTrade, row.trade.priceUsd);
+    const [live] = api.withRealtimeMarketSnapshots([item], item.createdAt);
+    const native = require('../src/gmgn-follow-bridge').toGmgnFollowSocketTrade(live);
+    assert.equal(Number(native.bts), item.totalSupply);
+    assert.equal(Number(native.pu), row.trade.priceUsd);
+  }
 });

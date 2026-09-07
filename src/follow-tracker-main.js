@@ -1,7 +1,7 @@
 (function installGmgnFollowThinBridge() {
   "use strict";
 
-  const BRIDGE_VERSION = "1.0.0";
+  const BRIDGE_VERSION = "1.0.3";
   const MESSAGE_CHANNEL = "gmgn-follow-trade-event-v1";
   const RETRY_OFFSETS_MS = Object.freeze([0, 100, 250, 500, 1_000, 2_000, 4_000]);
   const EVENT_TTL_MS = 5_000;
@@ -22,6 +22,9 @@
   let followWalletSocket = null;
   let decodeSubscription = null;
   const settledSounds = new Map();
+  const gmgnSupplyCache = new Map();
+  const gmgnSupplyRequests = new Map();
+  let gmgnTokenBriefApi = null;
   let nativeSound = null;
   let nativeSoundSettings = null;
   let flushTimer = null;
@@ -56,7 +59,7 @@
     // retains factory keys, so WeakMap alone does not release cached strings.
     const matches = ["getQuotationSocketMgr", "audio_played_uuids", "audio_channel",
       "REQUEST_TRY_PLAY", "followingType", "followingState", "notificationVolume",
-      "getAxios=function", ".Network"].filter((marker) => source.includes(marker)).join(" ");
+      "getAxios=function", ".Network", "/api/v1/token_info_brief"].filter((marker) => source.includes(marker)).join(" ");
     webpackFactoryMatches.set(factory, matches);
     return matches;
   }
@@ -267,6 +270,7 @@
     const entry = [...pendingEvents.values()].find((entry) => entry.deliveryId === deliveryId);
     if (!entry?.delivered || entry.confirmed || Date.now() >= entry.expiresAt) return;
     entry.confirmed = true;
+    if (entry.pumpMarketPending && !entry.metadataResolved) entry.expiresAt = entry.queuedAt + 30_000;
     acknowledge(deliveryId, "accepted", "ROW_RENDERED");
     finishResolvedEntry(entry.key, entry);
     scheduleNextRetry();
@@ -322,6 +326,7 @@
       }
       if (entry.nextAttemptAt > now || attempted >= MAX_FLUSH_BATCH) continue;
       attempted += 1;
+      if (now >= entry.queuedAt + EVENT_TTL_MS) entry.soundResolved = true;
       const delivered = deliverToNativeSocket(entry);
       if (delivered && entry.metadataPending && socketReadyForChain(entry.row)) {
         try {
@@ -335,7 +340,7 @@
         // Keep retryable sound failures within this event's deadline without
         // awaiting audio in the delivery loop or re-inserting the native row.
         entry.soundPending = true;
-        playNativeFollowingSound(entry.row, entry.expiresAt).catch(() => "retry").then((result) => {
+        playNativeFollowingSound(entry.row, entry.queuedAt + EVENT_TTL_MS).catch(() => "retry").then((result) => {
           if (pendingEvents.get(key) !== entry) return;
           entry.soundPending = false;
           if (result !== "retry") {
@@ -386,7 +391,101 @@
     return `${clean}${clean.includes("#") ? "&" : "#"}gmgn-follow-delivery=${encodeURIComponent(deliveryId)}`;
   }
 
+  function discoverGmgnTokenBriefApi() {
+    if (gmgnTokenBriefApi) return gmgnTokenBriefApi;
+    // Use GMGN's own API wrapper, including its session and response decoding.
+    // This exact endpoint returns human-unit total_supply (do not divide it by decimals).
+    const accepts = value => {
+      try {
+        return Object.values(value || {}).find(candidate => typeof candidate === "function"
+          && /["']\/api\/v1\/token_info_brief["']/.test(Function.prototype.toString.call(candidate)));
+      } catch { return null; }
+    };
+    const module = webpackModuleFromFactoryMarkers(["/api/v1/token_info_brief"], accepts);
+    gmgnTokenBriefApi = accepts(module);
+    return gmgnTokenBriefApi;
+  }
+
+  function supplyKey(chain, address) {
+    return `${chain}:${chain === "sol" ? address : address.toLowerCase()}`;
+  }
+
+  function cachedGmgnSupply(chain, address) {
+    const entry = gmgnSupplyCache.get(supplyKey(chain, address));
+    return entry && Date.now() - entry.at < (entry.supply ? 30_000 : 3_000) ? entry : null;
+  }
+
+  function requestGmgnSupply(chain, address) {
+    const cached = cachedGmgnSupply(chain, address);
+    if (cached) return Promise.resolve(cached);
+    const key = supplyKey(chain, address);
+    if (gmgnSupplyRequests.has(key)) return gmgnSupplyRequests.get(key).promise;
+    if (gmgnSupplyRequests.size >= 16) return Promise.resolve(null);
+    let resolvePromise, subscription = null, timeout = null, finished = false;
+    const promise = new Promise(resolve => { resolvePromise = resolve; });
+    const record = { promise, cancel: () => finish(null, false) };
+    function finish(supply, cache = true) {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timeout);
+      try { subscription?.unsubscribe(); } catch {}
+      gmgnSupplyRequests.delete(key);
+      const result = { supply, at: Date.now() };
+      if (cache) {
+        gmgnSupplyCache.delete(key);
+        gmgnSupplyCache.set(key, result);
+        while (gmgnSupplyCache.size > 256) gmgnSupplyCache.delete(gmgnSupplyCache.keys().next().value);
+      }
+      resolvePromise(result);
+    }
+    gmgnSupplyRequests.set(key, record);
+    timeout = setTimeout(() => finish(null), 6_000);
+    try {
+      const api = discoverGmgnTokenBriefApi();
+      const response = api?.(chain, [address]);
+      if (typeof response?.subscribe !== "function") finish(null);
+      else {
+        subscription = response.subscribe({
+          next(payload) {
+            const token = Array.isArray(payload?.tokens) && payload.tokens.find(token => (
+              token?.chain === chain && typeof token.address === "string"
+              && supplyKey(chain, token.address) === key
+            ));
+            const supply = bridge.finiteNumber(token?.total_supply);
+            finish(supply > 0 ? supply : null);
+          },
+          error: () => finish(null),
+          complete: () => finish(null),
+        });
+        // Observable responses may emit synchronously (native cache hit).
+        if (finished) subscription?.unsubscribe();
+      }
+    } catch { finish(null); }
+    return promise;
+  }
+
+  function withGmgnSupply(item, metadata) {
+    if (!(metadata?.supply > 0)) return item;
+    const price = bridge.finiteNumber(item.priceUsdAtTrade ?? item.priceUsdSnapshot);
+    return { ...item, totalSupplySnapshot: metadata.supply,
+      marketCapSnapshot: price > 0 ? price * metadata.supply : item.marketCapSnapshot,
+      marketSnapshotCapturedAt: metadata.at, marketSnapshotSource: "gmgn-token-info-brief" };
+  }
+
+  function completePumpMarketData(item, entry) {
+    if (item.platform !== "pump" || entry.metadataResolved) return;
+    requestGmgnSupply(entry.row.n, item.tokenAddress).then(metadata => {
+      if (pendingEvents.get(entry.key) !== entry || Date.now() >= entry.expiresAt) return;
+      updateTradeMetadata(withGmgnSupply(item, metadata));
+    }).catch(() => {});
+  }
+
   function queueTradeEvent(item, deliveryId) {
+    if (item?.platform === "pump"
+      && !(Number(item.totalSupplyAtTrade ?? item.totalSupplySnapshot ?? item.totalSupply) > 0)) {
+      const chain = bridge.NETWORK_CHAINS[Number(item.networkId)];
+      if (chain && typeof item.tokenAddress === "string") item = withGmgnSupply(item, cachedGmgnSupply(chain, item.tokenAddress));
+    }
     const row = bridge.toGmgnFollowSocketTrade(item);
     const key = bridge.trackingItemKey(item);
     const timestampMs = bridge.seconds(item?.createdAt) * 1_000;
@@ -425,11 +524,13 @@
       soundResolved: settledSounds.has(key),
       metadataResolved: Number(row.bts) > 0 && Number(row.pu) > 0,
       metadataPending: false,
+      pumpMarketPending: item.platform === "pump",
       queuedAt: now,
       nextAttemptAt: now,
       expiresAt: now + EVENT_TTL_MS,
     });
     scheduleFlush();
+    completePumpMarketData(item, pendingEvents.get(key));
     return true;
   }
 
@@ -468,6 +569,9 @@
           entry.expiresAt = 0;
           pendingEvents.delete(key);
         }
+      }
+      if (event.data.type === "trade-reset") {
+        for (const request of gmgnSupplyRequests.values()) request.cancel();
       }
       releaseDecodeObserver();
       if (!pendingEvents.size && flushTimer !== null) { clearTimeout(flushTimer); flushTimer = null; }

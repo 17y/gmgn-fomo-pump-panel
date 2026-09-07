@@ -26,6 +26,7 @@ function harness(count = 10) {
     applyCachedPumpEvmSymbols: x => x, schedulePumpEvmSymbolEnrichment() {},
     getFollowedTradesEnabled: async () => true, hydrateFollowedTradesHistory: async () => {},
     recordFollowedTradePipeline() {}, broadcastGmgnFollowTradeEvents: items => events.push(...items),
+    broadcastPumpLiveTrades: items => events.push(...items),
     broadcastGmgnFollowTradeMetadata() {}, filterUnfollowedTrades: x => x,
     persistFollowedTradesHistory: async () => { persists++; },
     isVerifiedFomoFollowedTrade: () => true, isVerifiedPumpFollowedTrade: () => true,

@@ -1,0 +1,21 @@
+{
+  "kind": "trade",
+  "author": {
+    "userId": "76129303-d90d-45f9-ae69-8c749505f90d",
+    "userName": "FlippingProfits",
+    "walletAddress": "DdM1tyCdoEyoxYYmGMjdf5rRPcpmj3UzZTpE7ScuTf7d"
+  },
+  "coinMint": "0x99b1887e985a985ecb23ac248421eac96cb92492",
+  "chainId": 4663,
+  "walletAddress": "DdM1tyCdoEyoxYYmGMjdf5rRPcpmj3UzZTpE7ScuTf7d",
+  "createdAt": "2026-09-07T01:40:36.000Z",
+  "symbol": "UNIHOOD",
+  "trade": {
+    "tx": "0xe8d0c4c1813c051964d161747cab65048d0c59e0192ed32889a8e2ad35bf0aba",
+    "isBuy": true,
+    "timestamp": "2026-09-07T01:40:36.000Z",
+    "amountUsd": 8854.019839,
+    "baseAmount": 17592581.110329762,
+    "priceUsd": 0.0005032814561702503
+  }
+}

@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "minimum_chrome_version": "116",
   "name": "GMGN Fomo Pump Panel",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "description": "把 Fomo/Pump 关注交易以事件方式推送到 GMGN 原生追踪流。",
   "permissions": [
     "storage",

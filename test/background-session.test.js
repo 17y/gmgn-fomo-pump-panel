@@ -345,6 +345,8 @@ function createHarness({
       PUMP_ALERTS_NATS_VERIFICATION: pumpApi.PUMP_ALERTS_NATS_VERIFICATION,
       PUMP_ALERTS_REST_VERIFICATION: pumpApi.PUMP_ALERTS_REST_VERIFICATION,
       sanitizeRealtimeAlertTrade: pumpApi.sanitizeRealtimeAlertTrade,
+      withRealtimeMarketSnapshots: pumpApi.withRealtimeMarketSnapshots,
+      SOLANA_RPC_ORIGIN: pumpApi.SOLANA_RPC_ORIGIN,
       buildPositionsRequest(params) {
         return { url: `https://frontend-api-v3.pump.fun/mint-positions/${params.address}`, method: "GET" };
       },
@@ -764,7 +766,7 @@ function createHarness({
           id: "extension-id",
           url: "chrome-extension://extension-id/offscreen.html",
         }, resolve);
-        assert.equal(pending, false);
+        assert.equal(pending, true);
       });
     },
     pumpNatsStatus(status) {
@@ -998,8 +1000,8 @@ test("Pump 正常 GMGN 页面无需诊断：首屏基线、30 秒增量、双来
     await h.reconcilePumpAlerts();
     assert.deepEqual(p.drainMessages(), [], "NATS 先到后 REST 不能重复投递");
     assert.equal(alerts().length, 3);
-    assert.equal(h.solanaRpcRequestCount(), 0);
-    assert.equal(h.pumpRequestMethods.some((r) => /\/following\/|\/profile\/|\/sol-price|\/coins-v3\//.test(r.url)), false, JSON.stringify(h.pumpRequestMethods));
+    assert.equal(h.solanaRpcRequestCount(), 0, "市值由 GMGN 页面补齐，不额外查链");
+    assert.equal(h.pumpRequestMethods.some((r) => /\/sol-price|\/coins-v3\//.test(r.url)), false, JSON.stringify(h.pumpRequestMethods));
     assert.equal(h.localData[FOLLOWED_TRADES_DIAGNOSTIC_KEY], undefined);
     p.send({ type: "gmgnFollowTradeVisibility", visible: false });
     assert.equal(h.pumpReconcileState().scheduled, true, "另一个可见页面仍需对账");
@@ -2945,7 +2947,7 @@ test("Pump 官方 NATS trade 不经 profile/RPC 重建即可进入 GMGN 投递�
       [followTrades.stableKey(item)],
     );
     assert.deepEqual(JSON.parse(JSON.stringify(pushed.response.notificationItemKeys)), []);
-    assert.equal(harness.solanaRpcRequestCount(), 0);
+    assert.equal(harness.solanaRpcRequestCount(), 0, "市值由 GMGN 页面补齐，不额外查链");
 
     const duplicate = await harness.pumpNatsAlertEvent(event);
     assert.equal(duplicate.ok, true);
@@ -4773,21 +4775,286 @@ test("公开配置忽略旧诊断开关，拒绝开启和来源检查，正常�
   } finally { p.disconnect(); }
 });
 
-test("公开配置关闭诊断后 Pump 新交易仍进入 GMGN 且双来源去重", async () => {
-  const h = createHarness(realtimePumpOptions({ publicRuntime: true, diagnosticsEnabled: true,
-    pumpTradePayload: { items: [] } }));
+for (const [chain, networkId] of Object.entries(core.TOKEN_NETWORK_IDS)) {
+  test(`公开配置关闭诊断后 Pump ${chain} 实时投递并按两种到达顺序去重`, async () => {
+    let items = [];
+    const h = createHarness(realtimePumpOptions({ publicRuntime: true, diagnosticsEnabled: true,
+      pumpTradePayload: () => ({ items }) }));
+    const p = h.connectGmgnTradeEvents();
+    const makeEvent = (id, hex) => {
+      const event = officialPumpEvent(id, h.now());
+      event.coin.chainId = String(networkId);
+      if (chain !== "sol") {
+        event.walletAddress = event.author.walletAddress = `0x${"Ab".repeat(20)}`;
+        event.coinMint = event.coin.mint = `0x${"Cd".repeat(20)}`;
+        event.trade.tx = `0x${hex.repeat(64)}`;
+      }
+      return event;
+    };
+    const acknowledge = (message) => p.send({ type: "gmgnFollowTradeAck", deliveryId: message.deliveryId,
+      status: "accepted", reason: "ROW_RENDERED" });
+    try {
+      await new Promise(setImmediate);
+      p.send({ type: "gmgnFollowTradeVisibility", visible: true });
+      h.runPumpReconcileTimer();
+      await h.reconcilePumpAlerts();
+      assert.deepEqual(p.drainMessages(), []);
+      h.advanceTime(30_000);
+      const restFirst = makeEvent("rest-first", "a");
+      items = [restFirst];
+      h.runPumpReconcileTimer();
+      await h.reconcilePumpAlerts();
+      const restMessages = p.drainMessages();
+      assert.equal(restMessages.length, 1);
+      assert.equal(restMessages[0].item.networkId, networkId);
+      acknowledge(restMessages[0]);
+      await h.pumpNatsAlertEvent(restFirst);
+      await new Promise(setImmediate);
+      assert.deepEqual(p.drainMessages(), [], "REST 先到后 NATS 不重复投递");
+      const natsFirst = makeEvent("nats-first", "b");
+      assert.equal((await h.pumpNatsAlertEvent(natsFirst)).accepted, true);
+      await new Promise(setImmediate);
+      const natsMessages = p.drainMessages();
+      assert.equal(natsMessages.length, 1);
+      assert.equal(natsMessages[0].item.networkId, networkId);
+      assert.equal(natsMessages[0].item.transactionHash, natsFirst.trade.tx);
+      assert.equal(natsMessages[0].item.sourceVerification, pumpApi.PUMP_ALERTS_NATS_VERIFICATION);
+      acknowledge(natsMessages[0]);
+      await h.pumpNatsAlertEvent(natsFirst);
+      items = [natsFirst, ...items];
+      h.advanceTime(30_000);
+      h.runPumpReconcileTimer();
+      await h.reconcilePumpAlerts();
+      assert.deepEqual(p.drainMessages(), [], "NATS 重复和随后 REST 均不重复投递");
+      assert.equal(vm.runInContext("gmgnTradeDelivery.snapshot().acknowledged", h.runtimeContext), 2);
+      assert.equal(h.sessionData.followedTradeReceiptsV1, undefined);
+      assert.equal(vm.runInContext("tradeReceipts", h.runtimeContext), null);
+      assert.equal(vm.runInContext("tradeReceiptTimer", h.runtimeContext), null);
+    } finally { p.disconnect(); }
+  });
+}
+
+const pumpRealAlert = require('./fixtures/pump-evm-alert.json');
+const pumpRealAlertUser = require('./fixtures/pump-evm-alert-user.json');
+const pumpSunFixture = require('./fixtures/pump-0xsun-rkst.json');
+function pumpGapHarness(extra = {}) {
+  const f = pumpSunFixture;
+  return createHarness(realtimePumpOptions({ publicRuntime: true,
+    pumpIdentity: { userId: 'viewer-user', viewerWallet: 'A1EbAYSRyWCUgRi3Q9iphNtRD3pAqTrm2sq79CR5J4v8' },
+    pumpFollowingPayload: [{ address: f.user.canonical_svm_wallet, username: f.user.username, user_id: f.user.userId }],
+    pumpUserPayload: f.user,
+    pumpTradePayload: { items: [] },
+    rpcPayload: (requests) => requests.map((r) => ({ jsonrpc: '2.0', id: r.id,
+      result: r.params[0] === f.transaction.hash
+        ? r.method === 'eth_getTransactionByHash' ? f.transaction : f.receipt
+        : null })),
+    ...extra,
+  }));
+}
+async function startPumpGapHarness(h) {
+  const p = h.connectGmgnTradeEvents();
+  await new Promise(setImmediate);
+  p.send({ type: 'gmgnFollowTradeVisibility', visible: true });
+  h.runPumpReconcileTimer();
+  await h.reconcilePumpAlerts();
+  return p;
+}
+
+test('真实 Pump EVM Alerts 的 Solana 主页地址映射为 EVM 钱包，REST 与 NATS 只投递一次', async () => {
+  let items = [];
+  const h = createHarness(realtimePumpOptions({ publicRuntime: true,
+    pumpUserPayload: pumpRealAlertUser, pumpTradePayload: () => ({ items }) }));
+  const p = await startPumpGapHarness(h);
+  try {
+    h.advanceTime(30_000);
+    const row = { ...pumpRealAlert, createdAt: new Date(h.now()).toISOString() };
+    items = [row];
+    h.runPumpReconcileTimer(); await h.reconcilePumpAlerts();
+    const received = p.drainMessages();
+    assert.equal(received.length, 1);
+    assert.equal(received[0].item.walletAddress, pumpRealAlertUser.canonical_evm_wallet.toLowerCase());
+    assert.equal(received[0].item.transactionHash, row.trade.tx);
+    assert.ok(require('../src/gmgn-follow-bridge').toGmgnTrade(received[0].item));
+    p.send({ type: 'gmgnFollowTradeAck', deliveryId: received[0].deliveryId, status: 'accepted', reason: 'ROW_RENDERED' });
+    const event = { ...row, id: 'actual-shape-nats', coin: { mint: row.coinMint, chainId: row.chainId, symbol: row.symbol } };
+    assert.equal((await h.pumpNatsAlertEvent(event)).accepted, true);
+    await new Promise(setImmediate);
+    assert.deepEqual(p.drainMessages(), []);
+    assert.equal(h.pumpRequestMethods.filter(r => r.url.endsWith('/users/' + pumpRealAlertUser.canonical_svm_wallet)).length, 1, '跨来源共享用户映射');
+    assert.equal(h.sessionData.followedTradeReceiptsV1, undefined);
+  } finally { p.disconnect(); }
+});
+
+test('真实 EVM NATS 并发首条消息共享钱包查询，重复事件不重复推送', async () => {
+  const h = createHarness(realtimePumpOptions({ publicRuntime: true, pumpUserPayload: pumpRealAlertUser }));
   const p = h.connectGmgnTradeEvents();
   try {
     await new Promise(setImmediate);
-    const item = officialPumpEvent("public-release", h.now());
-    await h.pumpNatsAlertEvent(item);
-    const message = await p.nextMessage();
-    assert.equal(message.item.transactionHash, item.trade.tx);
-    p.send({ type: "gmgnFollowTradeAck", deliveryId: message.deliveryId, status: "accepted", reason: "ROW_RENDERED" });
-    await h.pumpNatsAlertEvent(item);
+    const row = pumpRealAlert;
+    const event = { ...row, id: 'nats-first-profile-wallet', createdAt: new Date(h.now()).toISOString(),
+      coin: { mint: row.coinMint, chainId: row.chainId, symbol: row.symbol } };
+    const responses = await Promise.all([h.pumpNatsAlertEvent(event), h.pumpNatsAlertEvent(event)]);
+    assert.equal(responses.filter(r => r.accepted).length, 1);
     await new Promise(setImmediate);
+    const received = p.drainMessages();
+    assert.equal(received.length, 1);
+    assert.equal(received[0].item.walletAddress, pumpRealAlertUser.canonical_evm_wallet.toLowerCase());
+    assert.equal(h.pumpRequestMethods.filter(r => r.url.includes('/users/')).length, 1);
+  } finally { p.disconnect(); }
+});
+
+for (const badUser of [
+  { ...pumpRealAlertUser, canonical_svm_wallet: '21rgbFW6sujQovCw3qt6R2EdE97Yzzvk8sSc37Bb72Cm' },
+  { ...pumpRealAlertUser, userId: 'wrong-user' },
+  { ...pumpRealAlertUser, canonical_evm_wallet: '' },
+]) {
+  test(`EVM Alerts 拒绝不匹配的用户钱包映射 ${JSON.stringify(badUser)}`, async () => {
+    const h = createHarness(realtimePumpOptions({ publicRuntime: true, pumpUserPayload: badUser }));
+    const p = h.connectGmgnTradeEvents();
+    try {
+      await new Promise(setImmediate);
+      const row = pumpRealAlert;
+      const response = await h.pumpNatsAlertEvent({ ...row, id: 'invalid-user', createdAt: new Date(h.now()).toISOString(),
+        coin: { mint: row.coinMint, chainId: row.chainId } });
+      assert.equal(response.accepted, false);
+      assert.deepEqual(p.drainMessages(), []);
+    } finally { p.disconnect(); }
+  });
+}
+
+test('0xSun RKST 真实个人动态与回执：Alerts 缺失时补推，之后 Alerts/NATS 到达仍只显示一次', async () => {
+  let transactions = [];
+  let alerts = [];
+  const h = pumpGapHarness({ pumpProfilePayload: () => ({ transactions }), pumpTradePayload: () => ({ items: alerts }) });
+  h.advanceTime(pumpSunFixture.profile.transactions[0].block_time * 1000 - h.now() - 30_000);
+  const p = await startPumpGapHarness(h);
+  try {
     assert.deepEqual(p.drainMessages(), []);
+    h.advanceTime(30_000);
+    transactions = pumpSunFixture.profile.transactions;
+    h.runPumpReconcileTimer(); await h.reconcilePumpAlerts();
+    const received = p.drainMessages();
+    assert.equal(received.length, 1, '缺失的官方 Alerts 由个人动态和回执共同验证后补推');
+    const item = received[0].item;
+    assert.equal(item.transactionHash, pumpSunFixture.transaction.hash);
+    assert.equal(item.walletAddress, pumpSunFixture.user.canonical_evm_wallet);
+    assert.equal(item.type, 'sell');
+    assert.equal(item.baseAmount, 1_500_000);
+    assert.equal(item.usdAmount, 12165.521068);
+    assert.equal(item.sourceVerification, pumpApi.PUMP_CHAIN_RPC_VERIFICATION);
+    assert.equal(item.createdAt, pumpSunFixture.profile.transactions[0].block_time * 1000);
+    assert.ok(require('../src/gmgn-follow-bridge').toGmgnTrade(item));
+    p.send({ type: 'gmgnFollowTradeAck', deliveryId: received[0].deliveryId, status: 'accepted', reason: 'ROW_RENDERED' });
+    const event = { id: 'sun-late-nats', kind: 'trade', createdAt: new Date(item.createdAt).toISOString(),
+      author: { userId: item.userId, userName: item.displayName, walletAddress: pumpSunFixture.user.canonical_svm_wallet },
+      coin: { chainId: 4663, mint: item.tokenAddress, symbol: 'RKST' },
+      trade: { tx: item.transactionHash, isBuy: false, amountUsd: item.usdAmount, baseAmount: item.baseAmount } };
+    assert.equal((await h.pumpNatsAlertEvent(event)).accepted, true);
+    alerts = [{ ...event, chainId: 4663, coinMint: item.tokenAddress, walletAddress: event.author.walletAddress }];
+    h.advanceTime(20_000); h.runPumpReconcileTimer(); await h.reconcilePumpAlerts();
+    assert.deepEqual(p.drainMessages(), []);
+    assert.equal(vm.runInContext('gmgnTradeDelivery.snapshot().acknowledged', h.runtimeContext), 1);
     assert.equal(h.sessionData.followedTradeReceiptsV1, undefined);
-    assert.equal(vm.runInContext("tradeReceiptTimer", h.runtimeContext), null);
+    assert.equal(vm.runInContext('tradeReceipts', h.runtimeContext), null);
+    assert.equal(h.pumpRequestMethods.some(r => /coins-v3|sol-price/.test(r.url)), false);
+  } finally { p.disconnect(); }
+});
+
+test('个人动态补漏忽略启动前交易，不把旧交易改时间重推', async () => {
+  const h = pumpGapHarness({ pumpProfilePayload: pumpSunFixture.profile });
+  h.advanceTime(pumpSunFixture.profile.transactions[0].block_time * 1000 - h.now() + 10_000);
+  const p = await startPumpGapHarness(h);
+  try {
+    assert.deepEqual(p.drainMessages(), []);
+    assert.equal(h.requestedRpcPayloads.length, 0);
+  } finally { p.disconnect(); }
+});
+
+test('个人动态回执失败时不推送，后续回执可用时自动恢复', async () => {
+  let transactions = [], ready = false;
+  const f = pumpSunFixture;
+  const h = pumpGapHarness({ pumpProfilePayload: () => ({ transactions }),
+    rpcPayload: requests => requests.map(r => ({ id: r.id,
+      result: !ready ? null : r.method === 'eth_getTransactionByHash' ? f.transaction : f.receipt })) });
+  h.advanceTime(f.profile.transactions[0].block_time * 1000 - h.now() - 10_000);
+  const p = await startPumpGapHarness(h);
+  try {
+    transactions = f.profile.transactions; h.advanceTime(10_000);
+    h.runPumpReconcileTimer(); await h.reconcilePumpAlerts();
+    assert.deepEqual(p.drainMessages(), []);
+    ready = true; h.advanceTime(10_000);
+    h.runPumpReconcileTimer(); await h.reconcilePumpAlerts();
+    assert.equal(p.drainMessages().length, 1);
+  } finally { p.disconnect(); }
+});
+
+test('个人动态查询期间关闭推送：旧响应不得投递，重启也不串入新会话', async () => {
+  let release, blocked = false;
+  const h = pumpGapHarness({ pumpProfilePayload: () => blocked
+    ? new Promise(resolve => { release = resolve; }) : { transactions: [] } });
+  h.advanceTime(pumpSunFixture.profile.transactions[0].block_time * 1000 - h.now() - 10_000);
+  const p = await startPumpGapHarness(h);
+  try {
+    blocked = true; h.advanceTime(10_000);
+    const pending = h.reconcilePumpAlerts();
+    await new Promise(setImmediate);
+    assert.equal(typeof release, 'function');
+    await h.setFollowedTradesEnabled(false);
+    const oldRelease = release;
+    blocked = false;
+    h.advanceTime(1_000);
+    await h.setFollowedTradesEnabled(true);
+    oldRelease(pumpSunFixture.profile); await pending;
+    assert.deepEqual(p.drainMessages().filter(m => m.type === 'gmgnFollowTradeEvent'), []);
+    assert.equal(h.requestedRpcPayloads.length, 0);
+  } finally { p.disconnect(); }
+});
+
+test('Alerts 接口失败时，独立的个人动态回执补漏仍能投递', async () => {
+  let transactions = [];
+  const h = pumpGapHarness({ pumpStatus: 503, pumpPublicStatus: 200, pumpPresenceStatus: 200,
+    pumpProfilePayload: () => ({ transactions }) });
+  h.advanceTime(pumpSunFixture.profile.transactions[0].block_time * 1000 - h.now() - 10_000);
+  const p = await startPumpGapHarness(h);
+  try {
+    transactions = pumpSunFixture.profile.transactions; h.advanceTime(10_000);
+    h.runPumpReconcileTimer(); await h.reconcilePumpAlerts();
+    assert.equal(p.drainMessages().filter(m => m.type === 'gmgnFollowTradeEvent').length, 1);
+  } finally { p.disconnect(); }
+});
+
+test('EVM 主页钱包查询失败不会占用事件去重键，相同事件可重试', async () => {
+  let ready = false;
+  const h = createHarness(realtimePumpOptions({ publicRuntime: true, pumpUserPayload: () => {
+    if (!ready) throw new Error('TEMPORARY_NETWORK_FAILURE');
+    return pumpRealAlertUser;
+  } }));
+  const p = h.connectGmgnTradeEvents();
+  try {
+    await new Promise(setImmediate);
+    const event = { ...pumpRealAlert, id: 'mapping-retry', createdAt: new Date(h.now()).toISOString(),
+      coin: { mint: pumpRealAlert.coinMint, chainId: 4663 } };
+    assert.equal((await h.pumpNatsAlertEvent(event)).accepted, false);
+    ready = true;
+    assert.equal((await h.pumpNatsAlertEvent(event)).accepted, true);
+    await new Promise(setImmediate);
+    assert.equal(p.drainMessages().length, 1);
+  } finally { p.disconnect(); }
+});
+
+test('个人动态轮换限制为每轮 20 人，关闭后不再安排周期检查', async () => {
+  const addresses = Array.from({ length: 25 }, (_, i) => '1'.repeat(31) + 'ABCDEFGHJKLMNPQRSTUVWXYZab'[i]);
+  const profiles = [];
+  const h = pumpGapHarness({ pumpFollowingPayload: addresses.map(address => ({ address, username: address })),
+    pumpUserPayload: url => ({ canonical_svm_wallet: url.split('/').at(-1), canonical_evm_wallet: '0x' + 'ab'.repeat(20) }),
+    pumpProfilePayload: url => { profiles.push(url); return { transactions: [] }; } });
+  const p = await startPumpGapHarness(h);
+  try {
+    assert.equal(profiles.length, 20);
+    h.advanceTime(30_000); h.runPumpReconcileTimer(); await h.reconcilePumpAlerts();
+    assert.equal(profiles.length, 40);
+    assert.equal(new Set(profiles).size, 25);
+    await h.setFollowedTradesEnabled(false);
+    assert.equal(h.pumpReconcileState().scheduled, false);
   } finally { p.disconnect(); }
 });

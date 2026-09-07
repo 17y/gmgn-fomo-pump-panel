@@ -84,6 +84,14 @@ function mainBridgeHarness(options = {}) {
       });
     },
   };
+  if (options.tokenBrief) factories.tokenBrief = (_module, exports) => {
+    void "/api/v1/token_info_brief";
+    exports.brief = function(chain, addresses) {
+      void "/api/v1/token_info_brief";
+      return options.tokenBrief(chain, addresses);
+    };
+  };
+
   const cache = {
     quotation: {
       exports: {
@@ -831,4 +839,127 @@ test('MAIN cross-version reinjection retains an in-flight history reply', async 
   assert.equal((await pending).data.list.length, 2);
   assert.equal(h.rows.length, 0);
   assert.equal(clock.pending, 0);
+});
+
+test('已确认的 Pump 记录允许较慢供应量更新，但五秒后不重放声音', async () => {
+  const clock = fakeClock();
+  const h = mainBridgeHarness({ clock });
+  const item = trade({ platform: 'pump', totalSupply: null });
+  h.emit(item, 'trade', 'pump-supply-delivery');
+  await clock.advance(0);
+  h.context.window.dispatchEvent({ type: 'message', source: h.context.window, origin: 'https://gmgn.ai',
+    data: { channel: 'gmgn-follow-trade-event-v1', type: 'trade-rendered', deliveryId: 'pump-supply-delivery' } });
+  await clock.advance(7000);
+  h.emit({ ...item, totalSupplySnapshot: 1_000_000_000 }, 'trade-metadata');
+  await clock.advance(0);
+  assert.equal(h.rows.length, 2);
+  assert.equal(h.rows[0].id, h.rows[1].id);
+  assert.equal(h.rows[1].bts, '1000000000');
+  assert.equal(h.sounds.length, 1);
+  await clock.advance(30_000);
+  assert.equal(clock.pending, 0);
+});
+
+function gmgnSupplyHarness() {
+  const clock = fakeClock(), requests = [];
+  let unsubscribed = 0;
+  const h = mainBridgeHarness({ clock, subscribedChains: ['bsc', 'robinhood', 'sol'],
+    tokenBrief(chain, addresses) {
+      return { subscribe(observer) {
+        requests.push({ chain, addresses, observer });
+        return { unsubscribe() { unsubscribed++; } };
+      } };
+    } });
+  return { h, clock, requests, get unsubscribed() { return unsubscribed; } };
+}
+function gmgnSupplyReply(request, overrides = {}) {
+  request.observer.next({ tokens: [{ chain: request.chain, address: request.addresses[0],
+    symbol: 'RKST', total_supply: '1000000000', decimals: 18, ...overrides }] });
+}
+
+test('GMGN 原生资料补齐 RKST 市值：供应量已是人类单位，不改变成交字段或重复声音', async () => {
+  const {h, clock, requests} = gmgnSupplyHarness();
+  const item = trade({platform: 'pump', networkId: 4663, totalSupply: null,
+    tokenAddress: '0x8d1612b4b78ebf08cfbf01a04fa270ccbb0509a2',
+    usdAmount: 12165.521068, baseAmount: 1_500_000, priceUsdAtTrade: 12165.521068 / 1_500_000 });
+  h.emit(item, 'trade', 'gmgn-mc'); await clock.advance(0);
+  assert.equal(h.rows.length, 1); assert.equal(h.rows[0].bts, undefined);
+  renderReceipt(h, 'gmgn-mc');
+  gmgnSupplyReply(requests[0], { price: '99999' }); await Promise.resolve(); await clock.advance(0);
+  assert.equal(requests[0].chain, 'robinhood');
+  assert.equal(h.rows.length, 2); assert.equal(h.rows[1].id, h.rows[0].id);
+  assert.equal(Number(h.rows[1].bts), 1_000_000_000);
+  assert.equal(Number(h.rows[1].pu) * Number(h.rows[1].bts), 8110347.378666666);
+  assert.equal(h.rows[1].ts, h.rows[0].ts); assert.equal(h.rows[1].au, h.rows[0].au);
+  assert.equal(h.sounds.length, 1); assert.equal(clock.pending, 0);
+});
+
+test('GMGN 市值请求合并并缓存 30 秒，跨链同地址隔离', async () => {
+  const {h, clock, requests} = gmgnSupplyHarness();
+  const item = trade({platform: 'pump', totalSupply: null});
+  h.emit(item, 'trade', 'cache1');
+  h.emit({...item, transactionHash: '0x' + 'cd'.repeat(32)}, 'trade', 'cache2');
+  await clock.advance(0); assert.equal(requests.length, 1);
+  renderReceipt(h, 'cache1'); renderReceipt(h, 'cache2');
+  gmgnSupplyReply(requests[0]); await clock.advance(0);
+  h.emit({...item, transactionHash: '0x' + 'ef'.repeat(32), priceUsdAtTrade: 0.001}, 'trade', 'cache3');
+  await clock.advance(0); renderReceipt(h, 'cache3');
+  assert.equal(requests.length, 1); assert.equal(h.rows.at(-1).bts, '1000000000');
+  assert.equal(h.rows.at(-1).pu, 0.001);
+  h.emit({...item, networkId: 4663}, 'trade', 'other-chain'); await clock.advance(0);
+  assert.equal(requests.length, 2); assert.equal(requests[1].chain, 'robinhood');
+  renderReceipt(h, 'other-chain'); gmgnSupplyReply(requests[1]); await clock.advance(31_000);
+  h.emit({...item, transactionHash: '0x' + 'aa'.repeat(32), createdAt: clock.Date.now()}, 'trade', 'expired-cache');
+  assert.equal(requests.length, 3);
+});
+
+for (const invalid of [{chain: 'sol'}, {address: '0x' + '99'.repeat(20)},
+  {total_supply: 'NaN'}, {total_supply: '0'}]) {
+  test(`GMGN 供应量响应错误时只保留原交易 ${JSON.stringify(invalid)}`, async () => {
+    const {h, clock, requests} = gmgnSupplyHarness();
+    h.emit(trade({platform: 'pump', totalSupply: null}), 'trade', 'invalid-mc');
+    await clock.advance(0); renderReceipt(h, 'invalid-mc');
+    gmgnSupplyReply(requests[0], invalid); await clock.advance(30_000);
+    assert.equal(h.rows.length, 1); assert.equal(h.rows[0].bts, undefined);
+    assert.equal(h.sounds.length, 1); assert.equal(clock.pending, 0);
+  });
+}
+
+test('GMGN 查询超时取消订阅，不补发交易或持续请求', async () => {
+  const fixture = gmgnSupplyHarness(), {h, clock, requests} = fixture;
+  h.emit(trade({platform: 'pump', totalSupply: null}), 'trade', 'timeout-mc');
+  await clock.advance(0); renderReceipt(h, 'timeout-mc');
+  await clock.advance(6000);
+  assert.equal(fixture.unsubscribed, 1); assert.equal(requests.length, 1);
+  gmgnSupplyReply(requests[0]); await clock.advance(30_000);
+  assert.equal(h.rows.length, 1); assert.equal(clock.pending, 0);
+});
+
+test('关闭推送取消 GMGN 元数据订阅，迟到结果不得恢复旧记录', async () => {
+  const fixture = gmgnSupplyHarness(), {h, clock, requests} = fixture;
+  h.emit(trade({platform: 'pump', totalSupply: null}), 'trade', 'cancel-mc');
+  await clock.advance(0); renderReceipt(h, 'cancel-mc');
+  h.emit(null, 'trade-reset');
+  gmgnSupplyReply(requests[0]); await clock.advance(0);
+  assert.equal(fixture.unsubscribed, 1); assert.equal(h.rows.length, 1);
+  assert.equal(clock.pending, 0);
+});
+
+test('Pump 自带供应量和 Fomo 消息不请求 GMGN 资料', async () => {
+  const {h, clock, requests} = gmgnSupplyHarness();
+  h.emit(trade({platform: 'pump'}));
+  h.emit(trade({transactionHash: '0x' + 'cd'.repeat(32), totalSupply: null}));
+  await clock.advance(5000);
+  assert.equal(requests.length, 0); assert.equal(h.rows.length, 2);
+});
+
+test('Solana 的 GMGN 供应量直接使用，地址大小写严格区分', async () => {
+  const {h, clock, requests} = gmgnSupplyHarness();
+  const item = trade({platform: 'pump', networkId: 1399811149, totalSupply: null,
+    tokenAddress: 'BsbsB3WLq7vbY5En3MBCAsTrcwaCxNKY2Mp5pGuLpump',
+    walletAddress: '21rgbFW6sujQovCw3qt6R2EdE97Yzzvk8sSc37Bb72Cm', transactionHash: 'sol-trade' });
+  h.emit(item, 'trade', 'sol-mc'); await clock.advance(0); renderReceipt(h, 'sol-mc');
+  gmgnSupplyReply(requests[0], {total_supply: '998700001.123456', decimals: 6});
+  await Promise.resolve(); await clock.advance(0);
+  assert.equal(h.rows[1].bts, '998700001.123456'); assert.equal(clock.pending, 0);
 });
