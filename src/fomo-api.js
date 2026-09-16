@@ -22,6 +22,7 @@
     "0x754704bc059f8c67012fed69bc8a327a5aafb603:143",
     "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48:1",
     "0x5fc5360d0400a0fd4f2af552add042d716f1d168:4663",
+    "0x3600000000000000000000000000000000000000:5042",
   ]);
   const FEED_TYPES = new Set(["swap_buy", "swap_sell", "transfer_in", "transfer_out"]);
   const FOLLOWED_TRADE_DIRECTIONS = new Map([
@@ -35,6 +36,7 @@
     [8453, "base"],
     [1399811149, "sol"],
     [4663, "robinhood"],
+    [5042, "arc"],
   ]);
 
   function assertParams(params) {

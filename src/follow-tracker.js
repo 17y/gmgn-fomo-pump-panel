@@ -1,7 +1,7 @@
 (function installGmgnFollowEventRelay() {
   "use strict";
 
-  const RELAY_VERSION = "1.0.3";
+  const RELAY_VERSION = "1.0.4";
   const MESSAGE_CHANNEL = "gmgn-follow-trade-event-v1";
   const RECONNECT_DELAYS_MS = Object.freeze([1_000, 2_000, 5_000]);
   const PLATFORM_IMAGE_SELECTOR = 'img[src*="gmgn-follow-source"]';
@@ -308,7 +308,7 @@
         reason: ["NATIVE_SOCKET_MISSING", "NATIVE_STREAM_UNOBSERVED", "NATIVE_STREAM_ERROR",
           "CHAIN_NOT_SUBSCRIBED", "NATIVE_HANDLE_DATA_THROW", "ROW_RENDERED",
           "NATIVE_ROW_NOT_OBSERVED", "NATIVE_DECODED_ROW_NOT_OBSERVED"].includes(event.data.reason) ? event.data.reason : "",
-        routeChain: ["eth", "bsc", "sol", "base", "robinhood"].includes(event.data.routeChain) ? event.data.routeChain : "",
+        routeChain: ["eth", "bsc", "sol", "base", "robinhood", "hyperevm", "arc"].includes(event.data.routeChain) ? event.data.routeChain : "",
       }); } catch {}
       return;
     }

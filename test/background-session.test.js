@@ -425,6 +425,7 @@ function createHarness({
         };
       }
       if (Object.values([
+        "https://rpc.hyperliquid.xyz/evm",
         "https://ethereum-rpc.publicnode.com",
         "https://bsc-rpc.publicnode.com",
         "https://rpc-bsc.blockmachine.io",
@@ -4837,6 +4838,131 @@ for (const [chain, networkId] of Object.entries(core.TOKEN_NETWORK_IDS)) {
 const pumpRealAlert = require('./fixtures/pump-evm-alert.json');
 const pumpRealAlertUser = require('./fixtures/pump-evm-alert-user.json');
 const pumpSunFixture = require('./fixtures/pump-0xsun-rkst.json');
+
+test('Pump quote completion shares one profile request and only updates the matching original trade', async () => {
+  let releaseProfile, profileCalls = 0;
+  const gate = new Promise(resolve => { releaseProfile = resolve; });
+  const h = createHarness(realtimePumpOptions({ publicRuntime: true,
+    pumpProfilePayload: async () => { profileCalls++; return gate; } }));
+  const p = h.connectGmgnTradeEvents();
+  try {
+    await new Promise(setImmediate);
+    const first = officialPumpEvent('quote-a', h.now());
+    const second = officialPumpEvent('quote-b', h.now());
+    await h.pumpNatsAlertEvent(first); await h.pumpNatsAlertEvent(second);
+    await new Promise(setImmediate);
+    const events = p.drainMessages().filter(m => m.type === 'gmgnFollowTradeEvent');
+    assert.equal(events.length, 2, 'profile response must not block delivery');
+    assert.equal(profileCalls, 1, 'same wallet shares the in-flight first page');
+    for (const m of events) p.send({ type: 'gmgnFollowTradeAck', deliveryId: m.deliveryId,
+      status: 'accepted', reason: 'ROW_RENDERED' });
+    await h.runtimeContext.publishFomoRealtimeItems([{ id: 'fomo-during-quote', platform: 'fomo',
+      type: 'buy', networkId: 56, createdAt: h.now(), tokenAddress: '0x' + '11'.repeat(20),
+      userId: 'fomo-friend', sourceVerification: 'fomo-trading-activity-websocket' }]);
+    assert.ok(p.drainMessages().some(m => m.type === 'gmgnFollowTradeEvent' && m.item.platform === 'fomo'));
+    releaseProfile({ transactions: [first, second].map((event, i) => ({
+      type: 'SWAP', chain: 'solana', tx_hash: event.trade.tx, block_time: h.now(),
+      token_in: { mint: event.coin.mint, amount: '100' },
+      token_out: { mint: pumpApi.WRAPPED_SOL_MINT, amount: String(0.15 + i), metadata: { symbol: 'SOL' } },
+    })), pagination: { next_cursor: 'must-not-follow' } });
+    for (let i = 0; i < 8; i++) await new Promise(setImmediate);
+    const updates = p.drainMessages();
+    assert.equal(updates.filter(m => m.type === 'gmgnFollowTradeEvent').length, 0);
+    const metadata = updates.filter(m => m.type === 'gmgnFollowTradeMetadata');
+    assert.equal(metadata.length, 2);
+    assert.equal(metadata[0].item.quoteAmount, 0.15);
+    assert.equal(metadata[1].item.quoteAmount, 1.15);
+    assert.equal(metadata[0].item.usdAmount, first.trade.amountUsd);
+    assert.equal(metadata[0].item.createdAt, Date.parse(first.createdAt));
+    assert.equal(profileCalls, 1);
+    await h.pumpNatsAlertEvent(first); await new Promise(setImmediate);
+    assert.equal(profileCalls, 1, 'duplicate delivery cannot restart quote enrichment');
+  } finally { p.disconnect(); releaseProfile({ transactions: [] }); }
+});
+
+test('Pump quote enrichment limits concurrency and queue size, and drops all results after disconnect', async () => {
+  const pending = [];
+  const h = createHarness(realtimePumpOptions({ publicRuntime: true,
+    pumpProfilePayload: () => new Promise(resolve => pending.push(resolve)) }));
+  const p = h.connectGmgnTradeEvents();
+  await new Promise(setImmediate);
+  const alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  for (let i = 0; i < 80; i++) {
+    h.runtimeContext.schedulePumpQuoteEnrichment({ platform: 'pump', type: 'buy', createdAt: h.now(),
+      networkId: core.TOKEN_NETWORK_IDS.sol, transactionHash: `quote-${i}`,
+      walletAddress: '2'.repeat(42) + alphabet[Math.floor(i / 58)] + alphabet[i % 58],
+      tokenAddress: 'BsbsB3WLq7vbY5En3MBCAsTrcwaCxNKY2Mp5pGuLpump',
+      sourceVerification: pumpApi.PUMP_ALERTS_NATS_VERIFICATION });
+  }
+  await new Promise(setImmediate);
+  assert.equal(pending.length, 2);
+  assert.equal(vm.runInContext('pumpQuoteInFlight', h.runtimeContext), 2);
+  assert.equal(vm.runInContext('pumpQuoteQueue.size', h.runtimeContext), 32);
+  assert.ok(vm.runInContext('pumpQuoteAttempts.size', h.runtimeContext) <= 128);
+  p.disconnect();
+  for (const resolve of pending) resolve({ transactions: [] });
+  for (let i = 0; i < 20; i++) await new Promise(setImmediate);
+  assert.equal(pending.length, 2, 'queued jobs do not issue requests after disconnect');
+  assert.equal(vm.runInContext('pumpQuoteInFlight', h.runtimeContext), 0);
+  assert.equal(vm.runInContext('pumpQuoteQueue.size + pumpQuoteProfileRequests.size', h.runtimeContext), 0);
+});
+
+test('Pump complete quote does not fetch a profile and unrelated profile transactions cannot fill a missing quote', async () => {
+  let calls = 0;
+  const h = createHarness(realtimePumpOptions({ publicRuntime: true, pumpProfilePayload: () => {
+    calls++; return { transactions: [{ type: 'SWAP', chain: 'solana', tx_hash: 'unrelated', block_time: h.now(),
+      token_in: { mint: 'BsbsB3WLq7vbY5En3MBCAsTrcwaCxNKY2Mp5pGuLpump', amount: 100 },
+      token_out: { mint: pumpApi.WRAPPED_SOL_MINT, amount: 777, metadata: { symbol: 'SOL' } } }] };
+  } }));
+  const p = h.connectGmgnTradeEvents();
+  try {
+    await new Promise(setImmediate);
+    const complete = officialPumpEvent('quote-complete', h.now());
+    Object.assign(complete.trade, { quoteAmount: 0.1, quoteAddress: pumpApi.WRAPPED_SOL_MINT, quoteSymbol: 'SOL' });
+    await h.pumpNatsAlertEvent(complete); await new Promise(setImmediate);
+    assert.equal(calls, 0);
+    await h.pumpNatsAlertEvent(officialPumpEvent('quote-missing', h.now()));
+    for (let i = 0; i < 8; i++) await new Promise(setImmediate);
+    assert.equal(calls, 1);
+    assert.equal(p.drainMessages().filter(m => m.type === 'gmgnFollowTradeMetadata').length, 0);
+  } finally { p.disconnect(); }
+});
+test('HyperEVM quote completion verifies the EVM profile identity and reuses the alert user lookup', async () => {
+  const token = '0xf09703969cf55aa8a05ee9c76ab3013477283666';
+  const tx = '0xb7d0adf6d64544ba4b0698bfba36a0c8e7935a09ce263f7e2140a7faac0d672e';
+  const usdc = '0xb88339cb7199b77e23db6e890353e22632ba630f';
+  for (const mismatch of [false, true]) {
+    let profileCalls = 0;
+    const h = createHarness(realtimePumpOptions({ publicRuntime: true, pumpUserPayload: pumpRealAlertUser,
+      pumpProfilePayload: () => { profileCalls++; return { transactions: [{
+        type: 'SWAP', chain: 'hyperevm', tx_hash: tx, block_time: h.now(),
+        wallet_address: mismatch ? '0x' + '11'.repeat(20) : pumpRealAlertUser.canonical_evm_wallet,
+        token_in: { mint: token, amount: 510197.07 },
+        token_out: { mint: usdc, amount: '2049.798341', metadata: { symbol: 'USDC' } },
+      }] }; } }));
+    const p = h.connectGmgnTradeEvents();
+    try {
+      await new Promise(setImmediate);
+      const event = { ...pumpRealAlert, id: 'synthetic-hyperevm-quote', chainId: 999, coinMint: token,
+        createdAt: new Date(h.now()).toISOString(), coin: { mint: token, chainId: 999, symbol: 'FIXTURE' },
+        trade: { ...pumpRealAlert.trade, tx } };
+      assert.equal((await h.pumpNatsAlertEvent(event)).accepted, true);
+      for (let i = 0; i < 10; i++) await new Promise(setImmediate);
+      const messages = p.drainMessages();
+      assert.equal(messages.filter(m => m.type === 'gmgnFollowTradeEvent').length, 1);
+      const metadata = messages.filter(m => m.type === 'gmgnFollowTradeMetadata');
+      assert.equal(metadata.length, mismatch ? 0 : 1);
+      if (!mismatch) {
+        assert.equal(metadata[0].item.quoteAmount, 2049.798341);
+        assert.equal(metadata[0].item.quoteAddress, usdc);
+        assert.equal(metadata[0].item.usdAmount, event.trade.amountUsd);
+      }
+      assert.equal(profileCalls, 1);
+      assert.equal(h.pumpRequestMethods.filter(r => r.url.includes('/users/')).length, 1);
+    } finally { p.disconnect(); }
+  }
+});
+
 function pumpGapHarness(extra = {}) {
   const f = pumpSunFixture;
   return createHarness(realtimePumpOptions({ publicRuntime: true,

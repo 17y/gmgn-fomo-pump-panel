@@ -32,6 +32,9 @@ function trade(overrides = {}) {
     tokenSymbol: "LIVE",
     usdAmount: 50,
     baseAmount: 100_000,
+    quoteAmount: 0.25,
+    quoteAddress: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
+    quoteSymbol: "WBNB",
     priceUsdAtTrade: 0.0005,
     totalSupply: 1_000_000_000,
     ...overrides,
@@ -683,6 +686,44 @@ function renderReceipt(h, deliveryId, origin = "https://gmgn.ai") {
   h.context.window.dispatchEvent({ type: "message", source: h.context.window, origin,
     data: { channel: "gmgn-follow-trade-event-v1", type: "trade-rendered", deliveryId } });
 }
+
+test('Pump missing spend updates the existing rendered row once without changing USD, timestamp or sound', async () => {
+  const clock = fakeClock(), h = mainBridgeHarness({ clock });
+  const item = trade({ platform: 'pump', quoteAmount: null, quoteAddress: '', quoteSymbol: '' });
+  h.emit(item, 'trade', 'quote-ticket'); await clock.advance(0);
+  renderReceipt(h, 'quote-ticket');
+  assert.equal(h.rows[0].qa, undefined);
+  assert.equal(h.sounds.length, 1);
+  await clock.advance(6000);
+  const filled = { ...item, quoteAmount: 0.123456, quoteAddress: '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c',
+    quoteSymbol: 'WBNB', usdAmount: 999, createdAt: item.createdAt + 1000 };
+  h.emit(filled, 'trade-metadata'); await clock.advance(0);
+  assert.equal(h.rows.length, 2);
+  assert.equal(h.rows[1].id, h.rows[0].id);
+  assert.equal(h.rows[1].qa, '0.123456');
+  assert.equal(h.rows[1].qad, filled.quoteAddress);
+  assert.equal(h.rows[1].qs, 'WBNB');
+  assert.equal(h.rows[1].au, item.usdAmount);
+  assert.equal(h.rows[1].ts, h.rows[0].ts);
+  h.emit({ ...filled, quoteAmount: 999 }, 'trade-metadata'); await clock.advance(0);
+  assert.equal(h.rows.length, 2);
+  assert.equal(h.sounds.length, 1);
+  assert.equal(clock.pending, 0);
+});
+
+test('Pump missing spend expires at 30 seconds without replaying the row or leaking an idle timer', async () => {
+  const clock = fakeClock(), h = mainBridgeHarness({ clock });
+  const item = trade({ platform: 'pump', quoteAmount: null, quoteAddress: '' });
+  h.emit(item, 'trade', 'missing-quote'); await clock.advance(0); renderReceipt(h, 'missing-quote');
+  await clock.advance(30_000);
+  const runs = clock.runs;
+  h.emit({ ...item, quoteAmount: 1, quoteAddress: '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c' }, 'trade-metadata');
+  await clock.advance(60_000);
+  assert.equal(h.rows.length, 1);
+  assert.equal(h.sounds.length, 1);
+  assert.equal(clock.pending, 0);
+  assert.equal(clock.runs, runs);
+});
 
 test("原生入口静默丢弃首笔时保持未确认，后续同 ID 重试恢复且只响一次", async () => {
   const clock = fakeClock();

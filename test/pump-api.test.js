@@ -56,7 +56,11 @@ test("Pump 余额变化 NATS subject 只接受规范钱包地址", () => {
 });
 
 test("Pump Position 请求对 EVM 与 Solana 地址使用网页同款参数", () => {
-  for (const params of [evmParams, solanaParams]) {
+  const arcParams = {
+    address: "0x2222222222222222222222222222222222222222",
+    networkId: 5042,
+  };
+  for (const params of [evmParams, solanaParams, arcParams]) {
     const request = api.buildPositionsRequest(params);
     const url = new URL(request.url);
     assert.equal(request.method, "GET");

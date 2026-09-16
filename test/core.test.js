@@ -24,6 +24,15 @@ test("解析 GMGN Solana token 路由", () => {
   });
 });
 
+test("解析 GMGN ARC token 路由并映射 Fomo chain", () => {
+  assert.deepEqual(core.parseTokenRoute(`/arc/token/${MIXED_CASE_EVM_ADDRESS}`), {
+    chain: "arc",
+    address: MIXED_CASE_EVM_ADDRESS.toLowerCase(),
+    networkId: 5042,
+    fomoChain: "arc",
+  });
+});
+
 test("忽略非 token、未知链和非法 CA 路由", () => {
   assert.equal(core.parseTokenRoute(`/bsc/address/${EVM_ADDRESS}`), null);
   assert.equal(core.parseTokenRoute(`/tron/token/${EVM_ADDRESS}`), null);

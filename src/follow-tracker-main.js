@@ -1,7 +1,7 @@
 (function installGmgnFollowThinBridge() {
   "use strict";
 
-  const BRIDGE_VERSION = "1.0.3";
+  const BRIDGE_VERSION = "1.0.4";
   const MESSAGE_CHANNEL = "gmgn-follow-trade-event-v1";
   const RETRY_OFFSETS_MS = Object.freeze([0, 100, 250, 500, 1_000, 2_000, 4_000]);
   const EVENT_TTL_MS = 5_000;
@@ -217,7 +217,7 @@
     if (typeof deliveryId !== "string" || deliveryId.length > 100) return;
     const routeChain = location.pathname?.split("/")[1] || "";
     window.postMessage({ channel: MESSAGE_CHANNEL, type: "trade-ack", deliveryId, status, reason,
-      routeChain: ["eth", "bsc", "sol", "base", "robinhood"].includes(routeChain) ? routeChain : "" }, location.origin);
+      routeChain: ["eth", "bsc", "sol", "base", "robinhood", "hyperevm", "arc"].includes(routeChain) ? routeChain : "" }, location.origin);
   }
 
   function observeDecodedStream() {
@@ -270,7 +270,7 @@
     const entry = [...pendingEvents.values()].find((entry) => entry.deliveryId === deliveryId);
     if (!entry?.delivered || entry.confirmed || Date.now() >= entry.expiresAt) return;
     entry.confirmed = true;
-    if (entry.pumpMarketPending && !entry.metadataResolved) entry.expiresAt = entry.queuedAt + 30_000;
+    if ((entry.pumpMarketPending && !entry.metadataResolved) || entry.pumpQuotePending) entry.expiresAt = entry.queuedAt + 30_000;
     acknowledge(deliveryId, "accepted", "ROW_RENDERED");
     finishResolvedEntry(entry.key, entry);
     scheduleNextRetry();
@@ -302,7 +302,8 @@
   }
 
   function finishResolvedEntry(key, entry) {
-    if (entry.delivered && entry.confirmed && entry.soundResolved && entry.metadataResolved && !entry.metadataPending) finishEntry(key);
+    if (entry.delivered && entry.confirmed && entry.soundResolved && entry.metadataResolved
+      && !entry.pumpQuotePending && !entry.metadataPending) finishEntry(key);
   }
 
   function retryAt(entry, now) {
@@ -525,6 +526,7 @@
       metadataResolved: Number(row.bts) > 0 && Number(row.pu) > 0,
       metadataPending: false,
       pumpMarketPending: item.platform === "pump",
+      pumpQuotePending: item.platform === "pump" && !(Number(row.qa) > 0 && row.qad),
       queuedAt: now,
       nextAttemptAt: now,
       expiresAt: now + EVENT_TTL_MS,
@@ -537,19 +539,26 @@
   function updateTradeMetadata(item) {
     const key = bridge.trackingItemKey(item);
     const entry = pendingEvents.get(key);
-    if (!entry || entry.metadataResolved || Date.now() >= entry.expiresAt) return false;
+    if (!entry || Date.now() >= entry.expiresAt) return false;
     const row = bridge.toGmgnFollowSocketTrade(item);
-    if (!row || row.id !== entry.row.id || !(Number(row.bts) > 0) || !(Number(row.pu) > 0)) return false;
+    if (!row || row.id !== entry.row.id) return false;
+    const fillMarket = !entry.metadataResolved && Number(row.bts) > 0 && Number(row.pu) > 0;
+    const fillQuote = item.platform === "pump" && entry.pumpQuotePending && Number(row.qa) > 0 && row.qad;
+    if (!fillMarket && !fillQuote) return false;
     entry.row = {
       ...entry.row,
       bs: entry.row.bs || row.bs,
       bn: entry.row.bn || row.bn,
       bl: entry.row.bl || row.bl,
-      bts: row.bts,
-      pu: Number(entry.row.pu) > 0 ? entry.row.pu : row.pu,
-      bp: Number(entry.row.bp) > 0 ? entry.row.bp : row.bp,
+      ...(fillMarket ? {
+        bts: row.bts,
+        pu: Number(entry.row.pu) > 0 ? entry.row.pu : row.pu,
+        bp: Number(entry.row.bp) > 0 ? entry.row.bp : row.bp,
+      } : {}),
+      ...(fillQuote ? { qa: row.qa, qad: row.qad, qs: row.qs } : {}),
     };
-    entry.metadataResolved = true;
+    if (fillMarket) entry.metadataResolved = true;
+    if (fillQuote) entry.pumpQuotePending = false;
     entry.metadataPending = entry.delivered;
     entry.nextAttemptAt = Date.now();
     scheduleFlush();

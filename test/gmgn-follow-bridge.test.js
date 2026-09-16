@@ -88,6 +88,11 @@ test("GMGN compact row 只携带原生 following_wallet_activity 字段", () => 
   assert.deepEqual(Object.keys(row).filter((key) => key.startsWith("extension_")), []);
 });
 
+test("Arc 交易映射到 GMGN arc 链", () => {
+  const row = bridge.toGmgnFollowSocketTrade(external({ networkId: 5042 }));
+  assert.equal(row.n, "arc");
+});
+
 test("同一 Fomo 交易的 WebSocket 与 REST id 不同仍使用同一稳定键", () => {
   const realtime = external({ id: "websocket-id" });
   const reconciled = external({ id: "rest-id", tokenSymbol: "FILLED" });
@@ -125,7 +130,7 @@ test("缺少来源身份、链、方向或 Token 时拒绝进入 GMGN 原生流"
     walletAddress: "",
     userId: "pump-user",
   })), null);
-  assert.equal(bridge.toGmgnFollowSocketTrade(external({ networkId: 999 })), null);
+  assert.equal(bridge.toGmgnFollowSocketTrade(external({ networkId: 999999 })), null);
   assert.equal(bridge.toGmgnFollowSocketTrade(external({ type: "transfer_in" })), null);
   assert.equal(bridge.toGmgnFollowSocketTrade(external({ tokenAddress: "" })), null);
 });

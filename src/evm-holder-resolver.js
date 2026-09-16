@@ -18,6 +18,7 @@
   const MAX_CANDIDATES = 800;
   const MAX_HOLDER_PAGES = 20;
   const RPC_CONFIG = new Map([
+    [999, { url: "https://rpc.hyperliquid.xyz/evm" }],
     [1, { url: "https://ethereum-rpc.publicnode.com", blockTimeMs: 12_000 }],
     [56, {
       url: "https://rpc-bsc.blockmachine.io",

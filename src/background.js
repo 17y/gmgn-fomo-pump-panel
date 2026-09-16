@@ -14,7 +14,7 @@ const TOKEN_CACHE_INDEX_KEY = "fomoTokenCacheIndexV2";
 const TOKEN_CACHE_ENTRY_PREFIX = "fomoTokenCacheEntryV2:";
 const TOKEN_CACHE_LIMIT = 50;
 const TOKEN_CACHE_MAX_AGE_MS = 5 * 60 * 1000;
-const DEFAULT_SUPPORTED_CHAINS = "1,56,143,4663,8453,1399811149";
+const DEFAULT_SUPPORTED_CHAINS = "1,56,143,4663,5042,8453,1399811149";
 const FOMO_PAGE_ORIGIN = "https://fomo.family";
 const FOMO_PAGE_URL = `${FOMO_PAGE_ORIGIN}/token`;
 const PUMP_API_ORIGIN = "https://frontend-api-v3.pump.fun";
@@ -82,6 +82,10 @@ const gmgnFollowTradeEventPorts = new Set();
 const visibleGmgnTradePorts = new Set();
 const gmgnHistoryRequestsByPort = new WeakMap();
 const fomoRequestsByToken = new Map();
+const pumpQuoteQueue = new Map();
+const pumpQuoteAttempts = new Map();
+const pumpQuoteProfileRequests = new Map();
+let pumpQuoteInFlight = 0;
 const blockscoutSnapshotsByToken = new Map();
 const resolvedHolderAddresses = new Map();
 const pumpHolderRequestsByToken = new Map();
@@ -2093,6 +2097,88 @@ async function normalizePumpAlertPage(payload) {
     items: resolved.map((result, index) => result.status === "fulfilled" ? result.value : rows[index]) });
 }
 
+function hasPumpQuoteAmount(item) {
+  return Number(item?.quoteAmount) > 0
+    && Boolean(GmgnFomoCore.normalizeWalletAddress(item?.quoteAddress, Number(item?.networkId)));
+}
+
+// Only enrich already observed Pump trades. Two requests at a time, one first
+// profile page per attempt, no polling or retries, and no new trade discovery.
+function schedulePumpQuoteEnrichment(item) {
+  if (item?.platform !== "pump" || hasPumpQuoteAmount(item)
+    || !hasFollowedTradeConsumers() || !followedTradesEnabled
+    || ![GmgnPumpApi.PUMP_ALERTS_NATS_VERIFICATION, GmgnPumpApi.PUMP_ALERTS_REST_VERIFICATION,
+      GmgnPumpApi.PUMP_CHAIN_RPC_VERIFICATION].includes(item.sourceVerification)) return;
+  const now = Date.now();
+  if (!(Number(item.createdAt) > now - 60_000) || Number(item.createdAt) > now + 5_000) return;
+  const key = GmgnFollowTrades.stableKey(item);
+  for (const [id, at] of pumpQuoteAttempts) if (now - at >= 60_000) pumpQuoteAttempts.delete(id);
+  if (!key || pumpQuoteAttempts.has(key) || pumpQuoteQueue.size >= 32) return;
+  pumpQuoteAttempts.set(key, now);
+  while (pumpQuoteAttempts.size > 128) pumpQuoteAttempts.delete(pumpQuoteAttempts.keys().next().value);
+  pumpQuoteQueue.set(key, { item, generation: pumpAlertsPresenceGeneration });
+  drainPumpQuoteQueue();
+}
+
+function drainPumpQuoteQueue() {
+  while (pumpQuoteInFlight < 2 && pumpQuoteQueue.size) {
+    const [key, job] = pumpQuoteQueue.entries().next().value;
+    pumpQuoteQueue.delete(key);
+    pumpQuoteInFlight += 1;
+    completePumpQuoteAmount(job).catch(() => {}).finally(() => {
+      pumpQuoteInFlight -= 1;
+      drainPumpQuoteQueue();
+    });
+  }
+}
+
+async function completePumpQuoteAmount({ item, generation }) {
+  const active = () => followedTradesEnabled && hasFollowedTradeConsumers()
+    && generation === pumpAlertsPresenceGeneration && Date.now() - item.createdAt < 60_000;
+  if (!active()) return;
+  const core = GmgnFomoCore;
+  let author;
+  if (item.networkId === core.TOKEN_NETWORK_IDS.sol) {
+    author = { address: core.normalizeWalletAddress(item.walletAddress, item.networkId) };
+  } else {
+    if (!item.userId) return;
+    const cached = [...pumpAlertUserCache.values()].find((entry) => (
+      entry.payload?.userId === item.userId && Date.now() - entry.cachedAt < PUMP_ALERT_USER_CACHE_MS
+    ));
+    const user = cached?.payload || await getPumpAlertUser(item.userId);
+    if (!active() || user?.userId !== item.userId
+      || core.normalizeWalletAddress(user?.canonical_evm_wallet, item.networkId) !== item.walletAddress) return;
+    author = GmgnPumpApi.withUserWallets({ address: user.canonical_svm_wallet }, user);
+  }
+  const profileAddress = core.normalizeWalletAddress(author?.address, core.TOKEN_NETWORK_IDS.sol);
+  if (!profileAddress || !active()) return;
+  let request = pumpQuoteProfileRequests.get(profileAddress);
+  if (!request) {
+    request = fetchPublicJson({ ...GmgnPumpApi.buildProfileTransactionsRequest(profileAddress), timeoutMs: 3_000 })
+      .finally(() => pumpQuoteProfileRequests.delete(profileAddress));
+    pumpQuoteProfileRequests.set(profileAddress, request);
+  }
+  const payload = await request;
+  if (!active()) return;
+  const key = GmgnFollowTrades.stableKey(item);
+  const transactions = GmgnPumpApi.profileTransactions(payload).filter((row) => {
+    const wallets = [row?.wallet_address, row?.walletAddress, row?.user_address, row?.evm_address]
+      .map((value) => core.normalizeWalletAddress(value, item.networkId)).filter(Boolean);
+    return wallets.every((wallet) => wallet === item.walletAddress);
+  });
+  const matches = GmgnPumpApi.sanitizeProfileSwaps({ transactions }, author)
+    .filter((candidate) => GmgnFollowTrades.stableKey(candidate) === key && hasPumpQuoteAmount(candidate));
+  if (matches.length !== 1) return;
+  const quote = matches[0];
+  const previous = followedTradesHistory.pump.find((candidate) => GmgnFollowTrades.stableKey(candidate) === key);
+  const current = previous || item;
+  if (hasPumpQuoteAmount(current) || !filterUnfollowedTrades([current]).length) return;
+  const enriched = { ...current, quoteAmount: quote.quoteAmount,
+    quoteAddress: quote.quoteAddress, quoteSymbol: quote.quoteSymbol };
+  rememberFollowedTrades("pump", [enriched]);
+  if (!previous) broadcastGmgnFollowTradeMetadata([enriched]);
+}
+
 async function fetchPumpFollowedTradePages(fetchPage, firstPayload = null, maxPages = GmgnPumpApi.FOLLOWED_TRADES_MAX_PAGES) {
   const items = [];
   const seenCursors = new Set();
@@ -3300,6 +3386,16 @@ function rememberFollowedTrades(platform, items) {
     acceptedItems,
     followedTradesHistory[platform],
   ).filter((item) => item?.platform === platform);
+  if (platform === "pump") {
+    const previous = new Map(followedTradesHistory.pump.map((item) => [GmgnFollowTrades.stableKey(item), item]));
+    const updates = merged.flatMap((item) => {
+      const first = previous.get(GmgnFollowTrades.stableKey(item));
+      return first && !hasPumpQuoteAmount(first) && hasPumpQuoteAmount(item)
+        ? [{ ...first, quoteAmount: item.quoteAmount, quoteAddress: item.quoteAddress, quoteSymbol: item.quoteSymbol }]
+        : [];
+    });
+    if (updates.length) broadcastGmgnFollowTradeMetadata(updates);
+  }
   followedTradesHistory[platform] = merged;
   persistFollowedTradesHistory().catch(() => {});
   return merged;
@@ -3480,7 +3576,7 @@ function diagnosticTradeRef(item) {
   const networkIdValue = item.networkId === null || item.networkId === undefined
     ? NaN
     : Number(item.networkId);
-  const chain = ["eth", "bsc", "robinhood", "base", "sol"].includes(item.chain || item.n)
+  const chain = ["eth", "bsc", "robinhood", "base", "sol", "hyperevm", "arc"].includes(item.chain || item.n)
     ? item.chain || item.n
     : "";
   const type = ["buy", "sell"].includes(item.type || item.side || item.s)
@@ -3517,7 +3613,7 @@ function sanitizeFollowedTradePipelineDetail(value) {
     return Number.isInteger(number) && number >= 0 ? Math.min(number, 10_000) : null;
   };
   const chains = Array.isArray(source.chains)
-    ? source.chains.filter((chain) => ["eth", "bsc", "robinhood", "base", "sol"].includes(chain))
+    ? source.chains.filter((chain) => ["eth", "bsc", "robinhood", "base", "sol", "hyperevm", "arc"].includes(chain))
     : [];
   return {
     count: count("count"),
@@ -3689,7 +3785,9 @@ function gmgnTradeEventKey(item) {
 
 function broadcastGmgnFollowTradeEvents(items, transport) {
   if (!followedTradesEnabled) return 0;
-  return gmgnTradeDelivery.publish(items, transport);
+  const added = gmgnTradeDelivery.publish(items, transport);
+  if (added) for (const item of items) schedulePumpQuoteEnrichment(item);
+  return added;
 }
 
 // GMGN's page supplies missing token metadata through its own market API.
@@ -4280,7 +4378,7 @@ async function ensureFomoAlertSocket(force = false) {
 function sanitizeBridgeDiagnostic(value) {
   if (!value || typeof value !== "object") return null;
   const chains = Array.isArray(value.chains)
-    ? value.chains.filter((chain) => ["eth", "bsc", "robinhood", "base", "sol"].includes(chain))
+    ? value.chains.filter((chain) => ["eth", "bsc", "robinhood", "base", "sol", "hyperevm", "arc"].includes(chain))
     : [];
   const queryKeys = Array.isArray(value.queryKeys)
     ? value.queryKeys.filter((key) => typeof key === "string").slice(0, 20)

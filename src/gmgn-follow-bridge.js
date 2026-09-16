@@ -9,7 +9,9 @@
   const NETWORK_CHAINS = Object.freeze({
     1: "eth",
     56: "bsc",
+    999: "hyperevm",
     4663: "robinhood",
+    5042: "arc",
     8453: "base",
     1399811149: "sol",
   });
@@ -160,9 +162,11 @@
       maker,
       side,
       base_address: tokenAddress,
-      quote_address: quoteAddress,
+      ...(platform !== "pump" || (quoteAmount !== null && quoteAddress)
+        ? { quote_address: quoteAddress } : {}),
       base_amount: market.baseAmount === null ? "0" : String(market.baseAmount),
-      quote_amount: quoteAmount === null ? "0" : String(quoteAmount),
+      ...(platform !== "pump" || (quoteAmount !== null && quoteAddress)
+        ? { quote_amount: quoteAmount === null ? "0" : String(quoteAmount) } : {}),
       amount_usd: market.amountUsd ?? 0,
       cost_usd: market.amountUsd ?? 0,
       buy_cost_usd: 0,
@@ -197,7 +201,8 @@
         tag_rank: {},
       },
       balance_info: null,
-      quote_symbol: tokenTicker(item?.quoteSymbol),
+      ...(platform !== "pump" || (quoteAmount !== null && quoteAddress)
+        ? { quote_symbol: tokenTicker(item?.quoteSymbol) } : {}),
     };
   }
 
@@ -234,9 +239,11 @@
       bp: trade.price,
       bot: trade.base_token.token_open_time,
       bct: trade.base_token.token_create_time,
-      qad: trade.quote_address,
-      qa: trade.quote_amount,
-      qs: trade.quote_symbol,
+      ...(trade.quote_amount === undefined ? {} : {
+        qad: trade.quote_address,
+        qa: trade.quote_amount,
+        qs: trade.quote_symbol,
+      }),
       mpe: trade.migrated_pool_exchange,
     };
   }

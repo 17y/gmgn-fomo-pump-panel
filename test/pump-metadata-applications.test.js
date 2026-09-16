@@ -35,6 +35,7 @@ function harness(count = 10) {
     publishFollowedTradesResponse: response => {snapshots.push(response); c.followedTradesSnapshot = {response};},
   });
   vm.runInContext([
+    block('function hasPumpQuoteAmount(', '// Only enrich already observed Pump trades.'),
     block('function setBoundedCache(', 'function getResolvedHolderAddress('),
     block('async function getPumpCoinMetadata(', 'function cachePumpRpcTrade('),
     block('function pumpItemNeedsCoinMetadata(', 'async function enrichPumpProfileItems('),

@@ -38,6 +38,24 @@ test("构造 metadata、holders 与排除 Thesis 的 Feed 请求", () => {
   assert.equal(gmgn.searchParams.get("orderby"), "amount_percentage");
 });
 
+test("ARC 持仓使用 5042、GMGN arc 路由和原生 USDC", () => {
+  const arcParams = { address: params.address, networkId: 5042 };
+  const requests = api.buildRequests(arcParams);
+  assert.equal(requests.metadata.body, JSON.stringify([`${params.address}:5042`]));
+  assert.deepEqual(
+    JSON.parse(new URL(requests.holders.url).searchParams.get("tokens")),
+    [{ address: params.address, networkId: 5042 }],
+  );
+  assert.equal(
+    new URL(api.buildGmgnHoldersRequest(arcParams).url).pathname,
+    `/vas/api/v1/token_holders/arc/${params.address}`,
+  );
+  assert.equal(
+    api.isFomoCashToken(5042, "0x3600000000000000000000000000000000000000"),
+    true,
+  );
+});
+
 test("清洗 Token metadata 和 About 字段", () => {
   const result = api.sanitizeMetadata({ responseObject: [{
     marketCap: "348200",

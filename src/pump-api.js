@@ -44,6 +44,13 @@
     { configs: '"configs":', instances: ',"instances":', escaped: false },
   ];
   const EVM_QUOTE_TOKENS = new Map([
+    [5042, new Map([
+      ["0x3600000000000000000000000000000000000000", "stable"],
+    ])],
+    [999, new Map([
+      ["0x5555555555555555555555555555555555555555", "native"],
+      ["0xb88339cb7199b77e23db6e890353e22632ba630f", "stable"],
+    ])],
     [1, new Map([
       ["0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", "native"],
       ["0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "stable"],
@@ -66,6 +73,12 @@
     ])],
   ]);
   const EVM_STABLE_TOKEN_DECIMALS = new Map([
+    [5042, new Map([
+      ["0x3600000000000000000000000000000000000000", 6],
+    ])],
+    [999, new Map([
+      ["0xb88339cb7199b77e23db6e890353e22632ba630f", 6],
+    ])],
     [1, new Map([
       ["0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", 6],
       ["0xdac17f958d2ee523a2206206994597c13d831ec7", 6],
@@ -499,6 +512,7 @@
     const rawChain = row?.chain ?? rawNetwork;
     const chain = typeof rawChain === "string" ? rawChain.toLowerCase() : "";
     if (chain === "solana") return SOLANA_NETWORK_ID;
+    if (chain === "hyperliquid") return core.TOKEN_NETWORK_IDS.hyperevm;
     if (/^[1-9A-HJ-NP-Za-km-z]{80,90}$/.test(String(row?.tx_hash || ""))) return SOLANA_NETWORK_ID;
     return core.TOKEN_NETWORK_IDS[chain] || null;
   }
@@ -519,6 +533,7 @@
       if (addressKind) return addressKind;
     }
     if (stableQuoteSymbol(symbol)) return "stable";
+    if (Number(networkId) === 999 && /^(?:HYPE|WHYPE)$/.test(String(symbol || "").trim().toUpperCase())) return "native";
     return /^(?:ETH|WETH|BNB|WBNB)$/.test(String(symbol || "").trim().toUpperCase())
       ? "native"
       : "";
@@ -1086,6 +1101,7 @@
     const numeric = Number(raw);
     if (Number.isInteger(numeric) && Object.values(core.TOKEN_NETWORK_IDS).includes(numeric)) return numeric;
     const name = typeof raw === "string" ? raw.toLowerCase() : "";
+    if (name === "hyperliquid") return core.TOKEN_NETWORK_IDS.hyperevm;
     return core.TOKEN_NETWORK_IDS[name] || null;
   }
 
@@ -1169,6 +1185,12 @@
         baseAmount: core.finiteNumber(
           trade.tokenAmount ?? trade.coinAmount ?? trade.baseAmount ?? trade.amountToken,
         ),
+        quoteAmount: core.finiteNumber(trade.quoteAmount ?? row.quoteAmount),
+        quoteAddress: tokenAddressForNetwork(
+          trade.quoteAddress ?? trade.quoteMint ?? row.quoteAddress, networkId,
+        ),
+        quoteSymbol: typeof (trade.quoteSymbol ?? row.quoteSymbol) === "string"
+          ? (trade.quoteSymbol ?? row.quoteSymbol).trim() : "",
         priceUsdAtTrade: core.finiteNumber(
           trade.priceUsdAtTrade ?? trade.tokenPriceUsdAtTrade ?? trade.priceUsd,
         ),

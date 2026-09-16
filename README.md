@@ -4,7 +4,9 @@
 
 GMGN Fomo Pump Panel 是一款 Chrome 扩展，把 Fomo / Pump 的持仓信息放到 GMGN 币种页面，并将你在这两个平台关注用户的买卖动态接入 GMGN 原生「追踪」。少切几个页面，在熟悉的看盘界面里了解谁还在持仓、关注的人有什么新动作。
 
-支持 Ethereum、BSC、Base、Solana 和 Robinhood Chain。
+支持 Ethereum、BSC、Base、Solana、Robinhood Chain 和 Arc。
+
+Pump 关注交易追踪额外支持 HyperEVM；HyperEVM 暂不提供持仓面板查询。
 
 ## 主要功能
 

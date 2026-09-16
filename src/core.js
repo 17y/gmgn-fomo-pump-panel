@@ -11,6 +11,8 @@
     base: 8453,
     sol: 1399811149,
     robinhood: 4663,
+    arc: 5042,
+    hyperevm: 999,
   });
 
   const FOMO_CHAIN_NAMES = Object.freeze({
@@ -19,6 +21,7 @@
     base: "base",
     sol: "solana",
     robinhood: "robinhood",
+    arc: "arc",
   });
 
   function validTokenAddress(value) {
@@ -43,7 +46,9 @@
 
     const chain = match[1].toLowerCase();
     const networkId = TOKEN_NETWORK_IDS[chain];
-    if (!networkId) return null;
+    // HyperEVM is enabled for Pump tracking only; keep holder queries scoped
+    // to the existing Fomo integrations.
+    if (!networkId || !FOMO_CHAIN_NAMES[chain]) return null;
 
     let address;
     try {
