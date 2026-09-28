@@ -526,6 +526,11 @@
           tab.classList.toggle("active", tab === button);
         }
         renderActiveTab(view);
+        const tab = view.activeTab;
+        const version = requestVersion;
+        if (tab !== "about") Promise.resolve(activeLoad?.promise).catch(() => {}).then(() => {
+          if (version === requestVersion && view.activeTab === tab && canLoadView(view)) load(view, true);
+        });
       });
     }
 
@@ -992,7 +997,7 @@
     link.rel = "noopener noreferrer";
     const retry = element("button", "", "Retry");
     retry.type = "button";
-    retry.addEventListener("click", () => load(view));
+    retry.addEventListener("click", () => load(view, false, true));
     actions.append(link, retry);
     wrapper.append(actions);
     view.content.replaceChildren(wrapper);
@@ -1045,7 +1050,7 @@
     }, REFRESH_MS);
   }
 
-  function load(view, silent = false) {
+  function load(view, silent = false, force = false) {
     if (!canLoadView(view)) return Promise.resolve();
     if (activeLoad?.view === view && activeLoad.version === requestVersion) {
       return activeLoad.promise;
@@ -1060,6 +1065,8 @@
         const result = await sendMessage({
           type: "queryFomoToken",
           params: { address: view.route.address, networkId: view.route.networkId },
+          includeFeed: view.activeTab === "feed" && !view.panel.classList.contains("collapsed"),
+          force,
         });
         if (version !== requestVersion || !canLoadView(view)) return;
         if (!result?.ok) return renderError(view, result?.error);
@@ -1067,7 +1074,6 @@
         const updatedAt = result.cached ? result.cachedAt : Date.now();
         const label = result.cached ? "Cached" : result.partial ? "Partially updated" : "Updated";
         const updatedLabel = `${label} ${new Date(updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
-        const firstLoadForRoute = currentData === null;
         currentData = withPumpItems(fomoData, currentPumpItems);
         renderCollapsedPosition(view, currentData.holders);
         view.status.textContent = updatedLabel;
@@ -1076,8 +1082,9 @@
         if (view.panel.classList.contains("collapsed")) return;
         renderHeader(view, currentData.metadata);
         renderActiveTab(view);
+        if (view.activeTab !== "holders") return;
         if (typeof refreshHolderFollowStates === "function") {
-          refreshHolderFollowStates(firstLoadForRoute);
+          refreshHolderFollowStates(force);
         }
 
         const pumpResult = await sendMessage({

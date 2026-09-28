@@ -21,7 +21,7 @@ function createLoadHarness(source, kind) {
     kind === "content" ? "\n  function syncRoute" : "\n  function setRoute",
   );
   let resolvePump;
-  const state = { fomoCalls: 0, pumpCalls: 0, renderedItems: [] };
+  const state = { fomoCalls: 0, pumpCalls: 0, renderedItems: [], messages: [], followForces: [] };
   const fomoData = { metadata: {}, holders: { items: [] } };
   const context = {
     Date,
@@ -31,6 +31,7 @@ function createLoadHarness(source, kind) {
     clearTimeout() {},
     state,
     refreshPumpNotice() {},
+    refreshHolderFollowStates(force) { state.followForces.push(force); },
     isActiveInstance() { return true; },
     renderHeader() {},
     renderCollapsedPosition() {},
@@ -44,6 +45,7 @@ function createLoadHarness(source, kind) {
       state.renderedItems = context.currentData.holders.items;
     },
     sendMessage(message) {
+      state.messages.push(message);
       if (message.type === "queryFomoToken") {
         state.fomoCalls += 1;
         return Promise.resolve({ ok: true, data: fomoData });
@@ -76,6 +78,7 @@ function createLoadHarness(source, kind) {
       var currentPumpItems = [];
       var currentData = null;
       var currentRoute = { address: "token", networkId: 56 };
+      var routeLoadTimer = null;
       var activeTab = "holders";
       var status = { textContent: "" };
       function showLoading() {}
@@ -83,10 +86,14 @@ function createLoadHarness(source, kind) {
   vm.runInNewContext(`${declarations}\n${loadSource}\nglobalThis.loadUnderTest = load;`, context);
   return {
     state,
-    start() {
+    setTab(tab) {
+      if (kind === "content") context.currentView.activeTab = tab;
+      else context.activeTab = tab;
+    },
+    start(force = false) {
       return kind === "content"
-        ? context.loadUnderTest(context.currentView)
-        : context.loadUnderTest();
+        ? context.loadUnderTest(context.currentView, false, force)
+        : context.loadUnderTest(false, force);
     },
     finishPump(items) {
       resolvePump({ ok: true, items });
@@ -106,6 +113,25 @@ test("holder refresh keeps one request per route so a slow Pump response can fin
 });
 
 for (const [name, source] of [["content", content], ["side panel", sidePanel]]) {
+  test(`${name} fetches Feed only when viewed and restores holder work on return`, async () => {
+    const h = createLoadHarness(source, name === "content" ? "content" : "sidepanel");
+    h.setTab("feed");
+    await h.start();
+    assert.equal(h.state.messages[0].includeFeed, true);
+    assert.equal(h.state.pumpCalls, 0);
+    h.setTab("about");
+    await h.start();
+    assert.equal(h.state.messages[1].includeFeed, false);
+    assert.equal(h.state.pumpCalls, 0);
+    h.setTab("holders");
+    const pending = h.start();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(h.state.messages[2].includeFeed, false);
+    assert.equal(h.state.pumpCalls, 1);
+    h.finishPump([]);
+    await pending;
+  });
+
   test(`${name} reuses the in-flight holder load and applies its delayed Pump result`, async () => {
     const harness = createLoadHarness(source, name === "content" ? "content" : "sidepanel");
     const first = harness.start();
@@ -128,3 +154,21 @@ test("only trusted visibility changes trigger holder reloads", () => {
     assert.match(source, /document\.addEventListener\("visibilitychange", \(event\) => \{\s*if \(!event\.isTrusted\) return;/);
   }
 });
+
+for (const [name, source] of [["content", content], ["side panel", sidePanel]]) {
+  test(`${name} distinguishes route loading from an explicit manual refresh`, async () => {
+    const h = createLoadHarness(source, name === "content" ? "content" : "sidepanel");
+    const initial = h.start();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(h.state.messages[0].force, false);
+    assert.equal(h.state.followForces[0], false);
+    h.finishPump([]);
+    await initial;
+    const manual = h.start(true);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(h.state.messages[2].force, true);
+    assert.equal(h.state.followForces[1], true);
+    h.finishPump([]);
+    await manual;
+  });
+}

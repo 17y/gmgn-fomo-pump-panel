@@ -6,6 +6,7 @@
   if (!core || !pumpApi) return;
 
   const REFRESH_MS = 5_000;
+  const ROUTE_SETTLE_MS = 300;
   const TOKEN_LOAD_TIMEOUT_MS = 13_000;
   const SIDE_PANEL_HEARTBEAT_MS = 20_000;
   const SIDE_PANEL_RECONNECT_MS = 500;
@@ -15,6 +16,7 @@
   let activeTab = "holders";
   let requestVersion = 0;
   let activeLoad = null;
+  let routeLoadTimer = null;
   const holderCopyStates = new Map();
   const holderFollowActions = new Map();
   let holderFollowState = { fomo: null, pump: null, errors: {} };
@@ -716,7 +718,7 @@
     link.rel = "noopener noreferrer";
     const retry = element("button", "", "Retry");
     retry.type = "button";
-    retry.addEventListener("click", () => load());
+    retry.addEventListener("click", () => load(false, true));
     if (!refreshingSession) actions.append(link);
     actions.append(retry);
     wrapper.append(actions);
@@ -747,10 +749,15 @@
     };
   }
 
-  function load(silent = false) {
+  function load(silent = false, force = false) {
     if (!currentRoute) {
       renderIdle();
       return Promise.resolve();
+    }
+    if (routeLoadTimer !== null) {
+      if (!force) return Promise.resolve();
+      clearTimeout(routeLoadTimer);
+      routeLoadTimer = null;
     }
     if (activeLoad?.version === requestVersion) return activeLoad.promise;
     const version = requestVersion;
@@ -765,6 +772,8 @@
         const result = await sendMessage({
           type: "queryFomoToken",
           params: { address: route.address, networkId: route.networkId },
+          includeFeed: activeTab === "feed",
+          force,
         });
         if (version !== requestVersion || !currentRoute) return;
         if (!result?.ok) return renderError(result?.error);
@@ -772,13 +781,13 @@
         const updatedAt = result.cached ? result.cachedAt : Date.now();
         const label = result.cached ? "Cached" : result.partial ? "Partially updated" : "Updated";
         const updatedLabel = `${label} ${new Date(updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
-        const firstLoadForRoute = currentData === null;
         currentData = withPumpItems(fomoData, currentPumpItems);
         renderHeader(currentData.metadata);
         renderActiveTab();
         status.textContent = updatedLabel;
+        if (activeTab !== "holders") return;
         if (typeof refreshHolderFollowStates === "function") {
-          refreshHolderFollowStates(firstLoadForRoute);
+          refreshHolderFollowStates(force);
         }
 
         const pumpResult = await sendMessage({
@@ -814,6 +823,8 @@
     currentData = null;
     currentPumpItems = [];
     requestVersion += 1;
+    clearTimeout(routeLoadTimer);
+    routeLoadTimer = null;
     if (!currentRoute) {
       renderIdle();
       return true;
@@ -821,7 +832,11 @@
     openFomo.href = fomoTokenUrl(currentRoute);
     openFomo.hidden = false;
     renderPendingHeader(currentRoute);
-    load();
+    const version = requestVersion;
+    routeLoadTimer = setTimeout(() => {
+      routeLoadTimer = null;
+      if (version === requestVersion && currentRoute && document.visibilityState === "visible") load();
+    }, ROUTE_SETTLE_MS);
     return true;
   }
 
@@ -899,7 +914,7 @@
       .catch(() => {})
       .finally(() => {
         if (version !== requestVersion || currentRoute !== route || !currentRoute) return;
-        load();
+        load(true);
       });
   }
 
@@ -910,10 +925,15 @@
         tab.classList.toggle("active", tab === button);
       }
       renderActiveTab();
+      const tab = activeTab;
+      const version = requestVersion;
+      if (tab !== "about") Promise.resolve(activeLoad?.promise).catch(() => {}).then(() => {
+        if (version === requestVersion && activeTab === tab && currentRoute) load(true);
+      });
     });
   }
 
-  document.querySelector("[data-role='refresh']").addEventListener("click", () => load());
+  document.querySelector("[data-role='refresh']").addEventListener("click", () => load(false, true));
   chrome.runtime.onMessage.addListener((message) => {
     if (message?.type === "sidePanelRouteChanged") {
       syncActiveTab();

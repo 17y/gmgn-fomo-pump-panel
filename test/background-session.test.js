@@ -75,6 +75,9 @@ function createHarness({
   publicRuntime = false,
   initialAuthorization,
   responseStatus,
+  responseHeaders = {},
+  backoffState = null,
+  tokenAwareRequests = false,
   replacementAuthorization = null,
   pumpStatus = 200,
   pumpPresenceStatus = null,
@@ -144,6 +147,8 @@ function createHarness({
     };
   }
   const sessionData = receiptSessionData ? { followedTradeReceiptsV1: receiptSessionData } : {};
+  if (backoffState) sessionData.fomoApiBackoffV1 = backoffState;
+  const fomoBodies = [];
   const requestedAuthorizations = [];
   const requestedUrls = [];
   const requestedRpcUrls = [];
@@ -242,14 +247,15 @@ function createHarness({
     GmgnFomoApi: {
       GMGN_API_ORIGIN: "https://gmgn.ai",
       FOLLOWED_TRADES_MAX_PAGES: 3,
-      buildRequests() {
+      buildRequests(params) {
         const timeout = Number.isFinite(tokenRequestTimeoutMs)
           ? { timeoutMs: tokenRequestTimeoutMs }
           : {};
+        const query = tokenAwareRequests ? `?token=${params.address}&network=${params.networkId}` : "";
         return {
-          metadata: { url: "https://prod-api.fomo.family/metadata", method: "GET", ...timeout },
-          holders: { url: "https://prod-api.fomo.family/holders", method: "GET", ...timeout },
-          feed: { url: "https://prod-api.fomo.family/feed", method: "GET", ...timeout },
+          metadata: { url: `https://prod-api.fomo.family/metadata${query}`, method: "GET", ...timeout },
+          holders: { url: `https://prod-api.fomo.family/holders${query}`, method: "GET", ...timeout },
+          feed: { url: `https://prod-api.fomo.family/feed${query}`, method: "GET", ...timeout },
         };
       },
       buildTradeRequest(_params, holder) {
@@ -505,6 +511,7 @@ function createHarness({
         };
       }
       fomoRequestCount += 1;
+      fomoBodies.push(options.body);
       requestedUrls.push(_url);
       const responseDelay = typeof responseDelayMs === "function"
         ? responseDelayMs(_url)
@@ -530,6 +537,7 @@ function createHarness({
       return {
         ok: status >= 200 && status < 300,
         status,
+        headers: { get(name) { return responseHeaders[name.toLowerCase()] ?? null; } },
         async json() {
           if (responseJsonNeverSettles) return new Promise(() => {});
           const jsonDelay = typeof responseJsonDelayMs === "function"
@@ -550,7 +558,7 @@ function createHarness({
               options.signal?.addEventListener("abort", onAbort, { once: true });
             });
           }
-          return responsePayload(_url);
+          return responsePayload(_url, options);
         },
       };
     },
@@ -689,11 +697,14 @@ function createHarness({
     localData,
     localRemoveCalls,
     localSetCalls,
+    fomoBodies,
     sessionData,
     runtimeContext: context,
-    query(params = { address: "0x1234", networkId: 56 }) {
+    enrichFomo(items) { return context.enrichFomoFollowedTrades(items, localData[SESSION_KEY]); },
+    queryFomoRest(force = false) { return context.queryFomoFollowedTrades(true, force); },
+    query(params = { address: "0x1234", networkId: 56 }, options = {}) {
       return new Promise((resolve) => {
-        const pending = messageListener({ type: "queryFomoToken", params }, {}, resolve);
+        const pending = messageListener({ type: "queryFomoToken", params, ...options }, {}, resolve);
         assert.equal(pending, true);
       });
     },
@@ -1813,6 +1824,7 @@ test("诊断链路默认关闭，显式开启后才采集，关闭时清除记�
   const enabled = await harness.setFollowedTradeDiagnosticsEnabled(true);
   assert.equal(enabled.ok, true);
   assert.equal(enabled.enabled, true);
+  harness.advanceTime(300_001);
   await harness.query();
   const enabledSnapshot = await harness.getFollowedTradeDiagnostics();
   assert.equal(enabledSnapshot.diagnostic.enabled, true);
@@ -2126,8 +2138,9 @@ test("Fomo 元数据请求未结束时，后续实时交易仍立即投递", asy
         baseAmount: 100, usdAmount: 25 },
     });
     await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(metadataRequested, true);
     assert.deepEqual(port.drainMessages().map((message) => message.item.id), ["first", "second"]);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(metadataRequested, true);
   } finally {
     releaseMetadata({ tradeMetadata: [] });
     port.disconnect();
@@ -2200,7 +2213,7 @@ test("Fomo WebSocket 原始 swap 在同一流水线计算成交价并补齐成�
     JSON.parse(JSON.stringify(pushed.response.notificationItemKeys)),
     ["fomo:fomo:swap-live"],
   );
-  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setTimeout(resolve, 40));
   const enriched = port.drainMessages().find((message) => message.response.items
     .some((candidate) => candidate.id === "fomo:swap-live" && candidate.totalSupply === 1_000_000_000));
   assert.ok(enriched, "元数据在后台补齐，不阻塞第一条交易消息");
@@ -4322,6 +4335,9 @@ test("同一 Token 的重叠 Fomo 刷新复用同一组请求", async () => {
 
   const third = await harness.query();
   assert.equal(third.ok, true);
+  assert.equal(harness.fomoRequestCount(), 3);
+  harness.advanceTime(5_000);
+  await harness.query();
   assert.equal(harness.fomoRequestCount(), 6);
 });
 
@@ -4338,7 +4354,7 @@ test("Fomo 请求超时覆盖响应体读取，失败后 Retry 会真正重发",
   assert.equal(first.error, "FOMO_REQUEST_TIMEOUT");
   assert.equal(harness.fomoRequestCount(), 3);
 
-  const second = await harness.query();
+  const second = await harness.query(undefined, { force: true });
   assert.equal(second.ok, false);
   assert.equal(second.error, "FOMO_REQUEST_TIMEOUT");
   assert.equal(harness.fomoRequestCount(), 6);
@@ -5183,4 +5199,217 @@ test('个人动态轮换限制为每轮 20 人，关闭后不再安排周期检�
     await h.setFollowedTradesEnabled(false);
     assert.equal(h.pumpReconcileState().scheduled, false);
   } finally { p.disconnect(); }
+});
+
+test("Fomo Holders keeps 5-second live data but omits unused Feed and repeated viewer lookups", async () => {
+  const h = createHarness({ initialAuthorization: "stable", responseStatus: () => 200,
+    responsePayload: (url) => url.endsWith("/v2/users/current")
+      ? { responseObject: { id: "viewer-user" } } : { responseObject: [] } });
+  for (let i = 0; i < 12; i++) {
+    if (i) h.advanceTime(5_000);
+    assert.equal((await h.query(undefined, { includeFeed: false })).ok, true);
+    await h.queryHolderFollowStates(i === 0);
+  }
+  const count = (suffix) => h.requestedUrls.filter((url) => url.endsWith(suffix)).length;
+  assert.equal(count("/metadata"), 12);
+  assert.equal(count("/holders"), 12);
+  assert.equal(count("/feed"), 0);
+  assert.equal(count("/v2/users/current"), 1);
+  assert.equal(count("/followingIds"), 6);
+  assert.equal(h.fomoRequestCount(), 31);
+  const before = h.fomoRequestCount();
+  await h.query(undefined, { includeFeed: true });
+  assert.equal(h.fomoRequestCount() - before, 1, "opening Feed reuses the just-loaded holder/price data");
+});
+
+for (const status of [403, 430]) test(`Fomo ${status} pauses all REST reads and survives worker restart`, async () => {
+  const h = createHarness({ initialAuthorization: "stable", responseStatus: () => status });
+  await h.query();
+  for (let i = 0; i < 12; i++) {
+    h.advanceTime(5_000);
+    await h.query(undefined, { force: true });
+    await h.queryHolderFollowStates(true);
+  }
+  assert.equal(h.fomoRequestCount(), 3);
+  assert.equal(h.createdTabCount(), 0);
+  assert.equal(h.localData[SESSION_KEY].authorization, "stable");
+  const restarted = createHarness({ initialAuthorization: "stable", responseStatus: () => 200,
+    backoffState: h.sessionData.fomoApiBackoffV1 });
+  assert.equal((await restarted.query()).error, "FOMO_ACCESS_COOLDOWN");
+  assert.equal(restarted.fomoRequestCount(), 0);
+});
+
+for (const header of ["600", new Date(Date.now() + 600_000).toUTCString()]) {
+  test(`Fomo honors the full Retry-After value: ${header}`, async () => {
+    const h = createHarness({ initialAuthorization: "stable", responseStatus: () => 429,
+      responseHeaders: { "retry-after": header } });
+    await h.query();
+    const delay = h.sessionData.fomoApiBackoffV1.until - h.now();
+    assert.equal(delay, header === "600" ? 600_000 : Date.parse(header) - h.now());
+    h.advanceTime(120_001);
+    assert.equal((await h.query(undefined, { force: true })).error, "FOMO_RATE_LIMIT_BACKOFF");
+    assert.equal(h.fomoRequestCount(), 3);
+    h.advanceTime(480_000);
+    await h.query();
+    assert.equal(h.fomoRequestCount(), 6);
+  });
+}
+
+test("Fomo successful endpoints do not reset repeated 429 strikes", async () => {
+  const h = createHarness({ initialAuthorization: "stable",
+    responseStatus: (_auth, url) => url.endsWith("/holders") ? 429 : 200 });
+  await h.query();
+  assert.equal(h.sessionData.fomoApiBackoffV1.until - h.now(), 15_000);
+  h.advanceTime(15_001);
+  await h.query();
+  assert.equal(h.sessionData.fomoApiBackoffV1.until - h.now(), 30_000);
+});
+
+test("failed Fomo renewal clears only the unusable session and does not reopen a page each poll", async () => {
+  const h = createHarness({ initialAuthorization: "expired", responseStatus: () => 401 });
+  await h.query();
+  await new Promise((resolve) => setImmediate(resolve));
+  h.advanceTime(15_001);
+  await new Promise((resolve) => setTimeout(resolve, 280));
+  for (let i = 0; i < 3; i++) {
+    h.advanceTime(5_000);
+    assert.equal((await h.query()).error, "FOMO_NOT_CONNECTED");
+  }
+  assert.equal(h.createdTabCount(), 1);
+  assert.equal(h.fomoRequestCount(), 3);
+});
+
+test("Fomo session notification and recovery share the replacement-token reads", async () => {
+  const h = createHarness({ initialAuthorization: "expired", replacementAuthorization: "fresh",
+    responseStatus: (auth) => auth === "fresh" ? 200 : 401 });
+  await h.query();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.localData[SESSION_KEY].authorization, "fresh");
+  await h.query();
+  await new Promise((resolve) => setTimeout(resolve, 280));
+  assert.equal(h.fomoRequestCount(), 6);
+  assert.equal(h.createdTabCount(), 1);
+});
+
+test("Fomo reconnect and diagnostic catch-up share one in-flight REST request", async () => {
+  const h = createHarness({ initialAuthorization: "stable", responseStatus: () => 200, responseDelayMs: 15 });
+  await Promise.all([h.queryFomoRest(), h.queryFomoRest(true)]);
+  assert.equal(h.requestedUrls.filter((url) => url.includes("tradingActivity")).length, 1);
+});
+
+const metadataTestItem = (i) => ({ tokenAddress: `0x${i.toString(16).padStart(40, "0")}`,
+  networkId: 56, totalSupply: null, tokenImageUrl: "" });
+
+test("Fomo batches overlapping metadata requests and briefly caches empty results", async () => {
+  const h = createHarness({ initialAuthorization: "stable", responseStatus: () => 200 });
+  await Promise.all(Array.from({ length: 20 }, (_, i) => h.enrichFomo([metadataTestItem(i + 1)])));
+  assert.equal(h.fomoRequestCount(), 1);
+  assert.equal(JSON.parse(h.fomoBodies[0]).length, 20);
+  await h.enrichFomo([metadataTestItem(1)]);
+  assert.equal(h.fomoRequestCount(), 1);
+  h.advanceTime(15_001);
+  await Promise.all([h.enrichFomo([metadataTestItem(1), metadataTestItem(2)]),
+    h.enrichFomo([metadataTestItem(2), metadataTestItem(3)])]);
+  assert.equal(h.fomoRequestCount(), 2);
+  assert.equal(JSON.parse(h.fomoBodies[1]).length, 3);
+});
+
+test("Fomo metadata batch concurrency is bounded while every requested token completes", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const h = createHarness({ initialAuthorization: "stable", responseStatus: () => 200,
+    responsePayload: () => gate });
+  const pending = Promise.all(Array.from({ length: 130 }, (_, i) => h.enrichFomo([metadataTestItem(i + 1)])));
+  await new Promise((resolve) => setTimeout(resolve, 85));
+  assert.equal(h.fomoRequestCount(), 2);
+  assert.ok(h.fomoBodies.every((body) => JSON.parse(body).length <= 50));
+  release({ responseObject: [] });
+  assert.equal((await pending).length, 130);
+  assert.equal(h.fomoRequestCount(), 3);
+});
+
+test("Fomo access cooldown preserves an existing live stream but suppresses new connections", async () => {
+  const h = createHarness({ initialAuthorization: "stable", responseStatus: () => 403 });
+  const port = h.connectGmgnTradeEvents();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.webSockets.length, 1);
+  const socket = h.webSockets[0];
+  socket.open();
+  socket.receive({ type: "challengeAccepted" });
+  await h.query();
+  socket.receive({ type: "data", topicType: "trading_activity", topicId: "viewer-user",
+    payload: { id: "live-during-cooldown", platform: "fomo", type: "buy", createdAt: Date.now(),
+      networkId: 56, tokenAddress: "0x7777777777777777777777777777777777777777",
+      userId: "friend", baseAmount: 100, usdAmount: 25,
+      totalSupply: 1000000, tokenImageUrl: "https://example.com/token.png" } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(port.drainMessages().some((message) => message.item?.id === "live-during-cooldown"));
+  socket.close();
+  const secondPort = h.connectGmgnTradeEvents();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.webSockets.length, 1);
+  port.disconnect();
+  secondPort.disconnect();
+});
+
+test("disabling followed trades cancels queued Fomo metadata without losing the original items", async () => {
+  const h = createHarness({ initialAuthorization: "stable", responseStatus: () => 200 });
+  const item = metadataTestItem(1);
+  const pending = h.enrichFomo([item]);
+  await h.setFollowedTradesEnabled(false);
+  assert.equal((await pending)[0].tokenAddress, item.tokenAddress);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(h.fomoRequestCount(), 0);
+});
+
+test("30 distinct token visits in 60 seconds reuse account state without suppressing new-token data", async () => {
+  const h = createHarness({ initialAuthorization: "stable", responseStatus: () => 200,
+    tokenAwareRequests: true, responsePayload: (url) => url.endsWith("/v2/users/current")
+      ? { responseObject: { id: "viewer-user" } } : { responseObject: [] } });
+  for (let i = 0; i < 30; i++) {
+    if (i) h.advanceTime(2_000);
+    await h.query({ address: `0x${(i + 1).toString(16).padStart(40, "0")}`, networkId: 56 },
+      { includeFeed: false, force: false });
+    await h.queryHolderFollowStates(false);
+  }
+  const count = (path) => h.requestedUrls.filter((url) => new URL(url).pathname === path).length;
+  assert.equal(count("/metadata"), 30);
+  assert.equal(count("/holders"), 30);
+  assert.equal(count("/v2/users/current"), 1);
+  assert.equal(count("/v2/users/current/followingIds"), 6);
+  assert.equal(h.fomoRequestCount(), 67);
+});
+
+test("rapid A-B-A navigation reuses only fresh A data; manual refresh and expiry still fetch", async () => {
+  const h = createHarness({ initialAuthorization: "stable", responseStatus: () => 200, tokenAwareRequests: true });
+  const a = { address: "0x1111111111111111111111111111111111111111", networkId: 56 };
+  const b = { address: "0x2222222222222222222222222222222222222222", networkId: 56 };
+  for (const params of [a, b, a]) {
+    h.advanceTime(100);
+    await h.query(params, { includeFeed: false, force: false });
+  }
+  assert.equal(h.fomoRequestCount(), 4);
+  await h.query(a, { includeFeed: false, force: true });
+  assert.equal(h.fomoRequestCount(), 6);
+  h.advanceTime(5_000);
+  await h.query(a, { includeFeed: false, force: false });
+  assert.equal(h.fomoRequestCount(), 8);
+});
+
+
+test("manual follow refresh bypasses short reads and cached failures in the public runtime", async () => {
+  let followingIds = ["original"], status = 200;
+  const h = createHarness({ publicRuntime: true, initialAuthorization: "stable", responseStatus: (_auth, url) => url.endsWith("/followingIds") ? status : 200,
+    responsePayload: url => url.endsWith("/v2/users/current") ? { responseObject: { id: "viewer-user" } }
+      : { responseObject: { followingIds: [...followingIds] } } });
+  assert.deepEqual(Array.from((await h.queryHolderFollowStates()).states.fomo), ["original"]);
+  followingIds = ["new-follow"];
+  assert.deepEqual(Array.from((await h.queryHolderFollowStates()).states.fomo), ["original"], "automatic reads keep the snapshot");
+  assert.deepEqual(Array.from((await h.queryHolderFollowStates(true)).states.fomo), ["new-follow"], "explicit refresh reaches the server within the 1-second read cache");
+  status = 500;
+  assert.equal((await h.queryHolderFollowStates(true)).errors.fomo, "HTTP_500");
+  status = 200;
+  followingIds = ["recovered"];
+  assert.deepEqual(Array.from((await h.queryHolderFollowStates(true)).states.fomo), ["recovered"], "explicit refresh also bypasses cached transient failures");
+  assert.equal(h.localSetCalls.some(entry => Object.keys(entry).some(key => /Diagnostic|Pipeline|Receipts/.test(key))), false);
 });

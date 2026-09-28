@@ -28,6 +28,16 @@ const FOMO_SHARED_REQUEST_MAX_AGE_MS = FOMO_REQUEST_TIMEOUT_MS + 2_000;
 const FOMO_FEED_INITIAL_WAIT_MS = 750;
 const FOMO_FOLLOWED_TIMEOUT_MS = 10_000;
 const FOMO_FOLLOWED_METADATA_CACHE_MS = 60_000;
+const FOMO_METADATA_NEGATIVE_CACHE_MS = 15_000;
+const FOMO_METADATA_BATCH_MS = 25;
+const FOMO_METADATA_BATCH_SIZE = 50;
+const FOMO_METADATA_CONCURRENCY = 2;
+const FOMO_READ_CACHE_MS = 1_000;
+const FOMO_READ_CACHE_BUDGET = 2 * 1024 * 1024;
+const FOMO_READ_CACHE_ENTRY_BUDGET = 256 * 1024;
+const FOMO_CURRENT_USER_CACHE_MS = 5 * 60_000;
+const FOMO_ACCESS_COOLDOWN_MS = 5 * 60_000;
+const FOMO_BACKOFF_KEY = "fomoApiBackoffV1";
 const FOMO_ALERT_WS_URL = "wss://prod-api.fomo.family/ws";
 const FOMO_ALERT_TOPIC_TYPE = "trading_activity";
 const FOMO_ALERT_REST_CACHE_MS = 30_000;
@@ -91,13 +101,31 @@ const resolvedHolderAddresses = new Map();
 const pumpHolderRequestsByToken = new Map();
 const holderAddressRequests = new Map();
 let sessionRefreshPromise = null;
+let sessionRefreshAttempt = null;
+let fomoRejectedAuthorization = "";
+const fomoReadRequests = new Map();
+const fomoReadCache = new Map();
+const fomoReadFailures = new Map();
 let pumpPresenceOriginRulePromise = null;
 let fomoSessionWritePromise = Promise.resolve();
-let tokenCacheWritePromise = Promise.resolve();
+let tokenCacheWritePromise = null;
+const tokenCachePendingWrites = new Map();
 let creatingOffscreenDocument = null;
 let holderFollowRequest = null;
 let fomoRateLimitUntil = 0;
 let fomoRateLimitStrikes = 0;
+let fomoLastRateLimitAt = 0;
+let fomoBackoffReason = "FOMO_RATE_LIMIT_BACKOFF";
+const fomoBackoffReady = chrome.storage.session.get(FOMO_BACKOFF_KEY).then((saved) => {
+  const state = saved?.[FOMO_BACKOFF_KEY];
+  if (Number.isFinite(state?.until) && state.until > fomoRateLimitUntil) {
+    fomoRateLimitUntil = state.until;
+    fomoRateLimitStrikes = Number.isInteger(state.strikes) ? state.strikes : 0;
+    fomoLastRateLimitAt = Number.isFinite(state.lastAt) ? state.lastAt : 0;
+    fomoBackoffReason = state.reason === "FOMO_ACCESS_COOLDOWN"
+      ? state.reason : "FOMO_RATE_LIMIT_BACKOFF";
+  }
+}).catch(() => {});
 const recentFomoApiRequests = [];
 let followedTradesSnapshot = null;
 let followedTradesRequest = null;
@@ -116,10 +144,17 @@ let followedTradesPipelineSnapshotFingerprint = "";
 const followedTradesHistory = { fomo: [], pump: [] };
 let followedTradesHistoryHydration = null;
 let followedTradesCacheWritePromise = Promise.resolve();
+let followedTradesCacheNextWrite = null;
+let followedTradesCachePendingWrite = null;
 let followedTradesCacheFingerprint = "";
 let followedTradesWindow = null;
 const fomoFollowedMetadataCache = new Map();
 const fomoFollowedMetadataRequests = new Map();
+const fomoMetadataQueue = new Map();
+const fomoMetadataMisses = new Map();
+let fomoMetadataBatchTimer = null;
+let fomoMetadataBatchesRunning = 0;
+let fomoAlertRestRequest = null;
 let fomoAlertRestSnapshot = null;
 let fomoAlertSocket = null;
 let fomoAlertAuthTimer = null;
@@ -650,6 +685,8 @@ function updateFomoSession(patch) {
     );
     if (authorizationChanged) {
       holderFollowSnapshot = null;
+      fomoReadCache.clear();
+      fomoReadFailures.clear();
     }
     await chrome.storage.local.set({ [SESSION_KEY]: nextSession });
     if (authorizationChanged) await notifyFomoSessionChanged();
@@ -696,6 +733,8 @@ async function clearSession() {
   closeFomoAlertSocket();
   fomoAlertRestSnapshot = null;
   holderFollowSnapshot = null;
+  fomoReadCache.clear();
+  fomoReadFailures.clear();
   await Promise.all([
     chrome.storage.local.remove(SESSION_KEY),
     chrome.storage.session.remove(SESSION_KEY),
@@ -717,8 +756,19 @@ async function refreshSessionInBackground(previousAuthorization) {
   sessionRefreshPromise = (async () => {
     let tab;
     try {
+      await fomoBackoffReady;
+      const current = await getSession();
+      if (current?.authorization && current.authorization !== previousAuthorization) return current;
+      if (Date.now() < fomoRateLimitUntil) return null;
+      if (sessionRefreshAttempt?.authorization === previousAuthorization
+        && Date.now() - sessionRefreshAttempt.at < FOMO_ACCESS_COOLDOWN_MS) return null;
+      sessionRefreshAttempt = { authorization: previousAuthorization, at: Date.now() };
       tab = await chrome.tabs.create({ url: FOMO_PAGE_URL, active: false });
-      return await waitForReplacementSession(previousAuthorization);
+      const replacement = await waitForReplacementSession(previousAuthorization);
+      if (!replacement && (await getSession())?.authorization === previousAuthorization) {
+        await clearSession();
+      }
+      return replacement;
     } finally {
       if (Number.isInteger(tab?.id)) await chrome.tabs.remove(tab.id).catch(() => {});
       sessionRefreshPromise = null;
@@ -751,6 +801,44 @@ function setBoundedCache(cache, key, value, ttlMs, limit) {
   cache.delete(key);
   cache.set(key, value);
   while (cache.size > limit) cache.delete(cache.keys().next().value);
+}
+
+// A conservative cache weight, not a measurement of the JS heap. Stop early on
+// oversized/deep JSON instead of allocating another full JSON.stringify copy.
+function cacheValueWeight(value, limit) {
+  let weight = 0;
+  function visit(item, depth) {
+    if (typeof item === "string") weight += 16 + item.length * 2;
+    else if (item && typeof item === "object") {
+      weight += 32;
+      if (depth >= 64 || weight > limit) return false;
+      for (const key in item) {
+        if (!Object.hasOwn(item, key)) continue;
+        weight += 16 + key.length * 2;
+        if (weight > limit || !visit(item[key], depth + 1)) return false;
+      }
+    } else weight += 8;
+    return weight <= limit;
+  }
+  return visit(value, 0) ? weight : Infinity;
+}
+
+function cacheFomoReadResult(key, payload, cacheMs) {
+  const weight = cacheValueWeight(payload, FOMO_READ_CACHE_ENTRY_BUDGET) + key.length * 2;
+  fomoReadCache.delete(key);
+  if (weight > FOMO_READ_CACHE_ENTRY_BUDGET) return;
+  const now = Date.now();
+  let total = weight;
+  for (const [cachedKey, entry] of fomoReadCache) {
+    if (now >= entry.expiresAt) fomoReadCache.delete(cachedKey);
+    else total += entry.weight;
+  }
+  for (const [cachedKey, entry] of fomoReadCache) {
+    if (total <= FOMO_READ_CACHE_BUDGET && fomoReadCache.size < 128) break;
+    total -= entry.weight;
+    fomoReadCache.delete(cachedKey);
+  }
+  fomoReadCache.set(key, { cachedAt: now, expiresAt: now + cacheMs, payload, weight });
 }
 
 function getResolvedHolderAddress(key) {
@@ -807,9 +895,43 @@ async function writeTokenCacheEntry(params, data) {
 }
 
 function cacheToken(params, data) {
-  const write = tokenCacheWritePromise.then(() => writeTokenCacheEntry(params, data));
-  tokenCacheWritePromise = write.catch(() => {});
-  return write;
+  const key = tokenCacheId(params);
+  let entry = tokenCachePendingWrites.get(key);
+  if (entry) {
+    entry.data = data;
+    tokenCachePendingWrites.delete(key);
+  } else {
+    entry = { params, data };
+    entry.promise = new Promise((resolve, reject) => Object.assign(entry, { resolve, reject }));
+  }
+  tokenCachePendingWrites.set(key, entry);
+  while (tokenCachePendingWrites.size > TOKEN_CACHE_LIMIT) {
+    const oldest = tokenCachePendingWrites.keys().next().value;
+    // This is optional fallback storage; callers still return their fresh data.
+    tokenCachePendingWrites.get(oldest).resolve();
+    tokenCachePendingWrites.delete(oldest);
+  }
+  flushTokenCacheWrites();
+  return entry.promise;
+}
+
+function flushTokenCacheWrites() {
+  if (tokenCacheWritePromise) return;
+  tokenCacheWritePromise = Promise.resolve().then(async () => {
+    while (tokenCachePendingWrites.size) {
+      const [key, entry] = tokenCachePendingWrites.entries().next().value;
+      tokenCachePendingWrites.delete(key);
+      try {
+        await writeTokenCacheEntry(entry.params, entry.data);
+        entry.resolve();
+      } catch (error) {
+        entry.reject(error);
+      }
+    }
+  }).finally(() => {
+    tokenCacheWritePromise = null;
+    if (tokenCachePendingWrites.size) flushTokenCacheWrites();
+  });
 }
 
 function fomoRetryAfterMs(response) {
@@ -817,24 +939,35 @@ function fomoRetryAfterMs(response) {
   if (typeof value !== "string" || !value.trim()) return null;
   const seconds = Number(value);
   if (Number.isFinite(seconds) && seconds >= 0) {
-    return Math.min(Math.max(seconds * 1_000, 1_000), FOMO_RATE_LIMIT_MAX_MS);
+    return Math.max(seconds * 1_000, 1_000);
   }
   const deadline = Date.parse(value);
   if (!Number.isFinite(deadline)) return null;
-  return Math.min(Math.max(deadline - Date.now(), 1_000), FOMO_RATE_LIMIT_MAX_MS);
+  return Math.max(deadline - Date.now(), 1_000);
 }
 
 function registerFomoRateLimit(response) {
   const now = Date.now();
-  if (now < fomoRateLimitUntil) return;
-  fomoRateLimitStrikes += 1;
+  const alreadyCooling = now < fomoRateLimitUntil;
+  if (now - fomoLastRateLimitAt >= FOMO_ACCESS_COOLDOWN_MS) fomoRateLimitStrikes = 0;
+  if (now >= fomoRateLimitUntil) fomoRateLimitStrikes += 1;
+  fomoLastRateLimitAt = now;
   const fallback = FOMO_RATE_LIMIT_DEFAULT_MS * (2 ** Math.min(fomoRateLimitStrikes - 1, 3));
-  const retryAfterMs = fomoRetryAfterMs(response) || fallback;
-  fomoRateLimitUntil = now + Math.min(retryAfterMs, FOMO_RATE_LIMIT_MAX_MS);
+  const denied = [403, 430].includes(response.status);
+  const retryAfterMs = fomoRetryAfterMs(response)
+    ?? (denied ? FOMO_ACCESS_COOLDOWN_MS : Math.min(fallback, FOMO_RATE_LIMIT_MAX_MS));
+  fomoRateLimitUntil = Math.max(fomoRateLimitUntil, now + retryAfterMs);
+  if (denied || !alreadyCooling || fomoBackoffReason !== "FOMO_ACCESS_COOLDOWN") {
+    fomoBackoffReason = denied ? "FOMO_ACCESS_COOLDOWN" : "FOMO_RATE_LIMIT_BACKOFF";
+  }
+  chrome.storage.session.set({ [FOMO_BACKOFF_KEY]: {
+    until: fomoRateLimitUntil, strikes: fomoRateLimitStrikes,
+    lastAt: fomoLastRateLimitAt, reason: fomoBackoffReason,
+  } }).catch(() => {});
 }
 
 function fomoRateLimitError() {
-  const error = new Error("FOMO_RATE_LIMIT_BACKOFF");
+  const error = new Error(fomoBackoffReason);
   error.retryAt = fomoRateLimitUntil;
   return error;
 }
@@ -870,7 +1003,50 @@ function recordFomoApiRequestDiagnostic(request, startedAt, status, error) {
   }
 }
 
+// Only idempotent reads share results. Follow/unfollow writes are never replayed
+// from a cache. The short TTL absorbs route/session bursts, not 5-second updates.
 async function fetchJson(request, session) {
+  await fomoBackoffReady;
+  if (Date.now() < fomoRateLimitUntil) throw fomoRateLimitError();
+  if (session.authorization === fomoRejectedAuthorization) throw new Error("HTTP_401");
+  const read = request.method === "GET"
+    || (request.method === "POST" && new URL(request.url).pathname === "/proxy/filterTokens");
+  if (!read) return fetchFomoJson(request, session);
+  const key = JSON.stringify([session.authorization, session.supportedChains,
+    request.method, request.url, request.body]);
+  for (const [cachedKey, entry] of fomoReadCache) {
+    if (Date.now() >= entry.expiresAt) fomoReadCache.delete(cachedKey);
+  }
+  const cached = fomoReadCache.get(key);
+  if (!request.force && cached && Date.now() - cached.cachedAt < (request.cacheMs ?? FOMO_READ_CACHE_MS)) {
+    return cached.payload;
+  }
+  const failed = fomoReadFailures.get(key);
+  if (!request.force && failed && Date.now() - failed.cachedAt < FOMO_METADATA_NEGATIVE_CACHE_MS) {
+    throw new Error(failed.error);
+  }
+  const previous = fomoReadRequests.get(key);
+  if (previous && Date.now() - previous.startedAt < FOMO_SHARED_REQUEST_MAX_AGE_MS) return previous.promise;
+  const entry = { startedAt: Date.now(), promise: null };
+  entry.promise = fetchFomoJson(request, session).then((payload) => {
+    if (fomoReadRequests.get(key) !== entry) return payload;
+    cacheFomoReadResult(key, payload, request.cacheMs ?? FOMO_READ_CACHE_MS);
+    fomoReadFailures.delete(key);
+    return payload;
+  }).catch((error) => {
+    if (fomoReadRequests.get(key) === entry && !isFomoAuthError(error)
+      && !["HTTP_429", "FOMO_RATE_LIMIT_BACKOFF", "FOMO_ACCESS_COOLDOWN"].includes(error?.message)) {
+      setBoundedCache(fomoReadFailures, key, { cachedAt: Date.now(), error: error?.message || "FOMO_REQUEST_FAILED" }, FOMO_METADATA_NEGATIVE_CACHE_MS, 128);
+    }
+    throw error;
+  }).finally(() => {
+    if (fomoReadRequests.get(key) === entry) fomoReadRequests.delete(key);
+  });
+  fomoReadRequests.set(key, entry);
+  return entry.promise;
+}
+
+async function fetchFomoJson(request, session) {
   const startedAt = Date.now();
   let status = null;
   let errorCode = "";
@@ -896,10 +1072,10 @@ async function fetchJson(request, session) {
     });
     status = response.status;
     if (!response.ok) {
-      if (response.status === 429) registerFomoRateLimit(response);
+      if ([403, 429, 430].includes(response.status)) registerFomoRateLimit(response);
+      if (response.status === 401) fomoRejectedAuthorization = session.authorization;
       throw new Error(`HTTP_${response.status}`);
     }
-    if (Date.now() >= fomoRateLimitUntil) fomoRateLimitStrikes = 0;
     return await response.json();
   } catch (error) {
     if (error?.name === "AbortError") {
@@ -1398,18 +1574,20 @@ async function resolveEvmHolderFromChain(params, currentAmountRaw, buyTimestampM
   );
 }
 
-async function queryFomoToken(params, allowSessionRefresh = true) {
+async function queryFomoToken(params, allowSessionRefresh = true, options = {}) {
+  const includeFeed = options.includeFeed !== false;
   const requests = GmgnFomoApi.buildRequests(params);
+  for (const request of Object.values(requests)) request.force = options.force === true;
   const [session, cached] = await Promise.all([getSession(), getCachedToken(params)]);
   if (!session?.authorization) {
     return cached ? cachedResult(cached, "FOMO_NOT_CONNECTED") : { ok: false, error: "FOMO_NOT_CONNECTED" };
   }
 
   try {
-    const feedPromise = fetchJson(requests.feed, session).then(
+    const feedPromise = includeFeed ? fetchJson(requests.feed, session).then(
       (value) => ({ status: "fulfilled", value }),
       (reason) => ({ status: "rejected", reason }),
-    );
+    ) : Promise.resolve({ status: "skipped" });
     const [metadataResult, holdersResult] = await Promise.allSettled([
       fetchJson(requests.metadata, session),
       fetchJson(requests.holders, session),
@@ -1423,15 +1601,22 @@ async function queryFomoToken(params, allowSessionRefresh = true) {
     const freshMetadata = metadataResult.status === "fulfilled"
       ? GmgnFomoApi.sanitizeMetadata(metadataResult.value, params)
       : null;
+    if (metadataResult.status === "fulfilled") {
+      for (const item of GmgnFomoApi.sanitizeFollowedTradesMetadata(metadataResult.value)) {
+        setBoundedCache(fomoFollowedMetadataCache, item.key,
+          { cachedAt: Date.now(), item }, FOMO_FOLLOWED_METADATA_CACHE_MS, 512);
+      }
+    }
     const metadata = freshMetadata || cached?.data?.metadata;
     const freshHolders = holdersResult.status === "fulfilled" && metadata
       ? GmgnFomoApi.sanitizeHolders(holdersResult.value, params, metadata.totalSupply)
       : null;
     const holders = freshHolders || cached?.data?.holders;
-    const feedResult = await Promise.race([
+    let feedWaitTimer;
+    const feedResult = includeFeed ? await Promise.race([
       feedPromise,
-      new Promise((resolve) => setTimeout(() => resolve(null), FOMO_FEED_INITIAL_WAIT_MS)),
-    ]);
+      new Promise((resolve) => { feedWaitTimer = setTimeout(() => resolve(null), FOMO_FEED_INITIAL_WAIT_MS); }),
+    ]).finally(() => clearTimeout(feedWaitTimer)) : { status: "skipped" };
     const freshFeed = feedResult?.status === "fulfilled"
       ? GmgnFomoApi.sanitizeFeed(feedResult.value)
       : null;
@@ -1455,7 +1640,7 @@ async function queryFomoToken(params, allowSessionRefresh = true) {
     const cachedSections = [
       ...(!freshMetadata ? ["metadata"] : []),
       ...(!freshHolders ? ["holders"] : []),
-      ...(!freshFeed && cached?.data?.feed ? ["feed"] : []),
+      ...(includeFeed && !freshFeed && cached?.data?.feed ? ["feed"] : []),
     ];
     if (criticalSectionsFresh) await cacheToken(params, data).catch(() => {});
     if (!feedResult) {
@@ -1509,7 +1694,7 @@ async function queryFomoToken(params, allowSessionRefresh = true) {
       }
       refreshSessionInBackground(session.authorization)
         .then((replacement) => {
-          if (replacement?.authorization) queryFomoToken(params, false).catch(() => null);
+          if (replacement?.authorization) queryFomoTokenShared(params, { ...options, force: false }, false).catch(() => null);
         })
         .catch(() => null);
       return { ok: false, error: "FOMO_SESSION_REFRESHING" };
@@ -1522,14 +1707,14 @@ async function queryFomoToken(params, allowSessionRefresh = true) {
   }
 }
 
-function queryFomoTokenShared(params) {
-  const key = tokenCacheId(params);
+function queryFomoTokenShared(params, options = {}, allowSessionRefresh = true) {
+  const key = `${tokenCacheId(params)}:${options.includeFeed !== false}`;
   const pending = fomoRequestsByToken.get(key);
   if (pending && Date.now() - pending.startedAt < FOMO_SHARED_REQUEST_MAX_AGE_MS) {
     return pending.promise;
   }
   const entry = { startedAt: Date.now(), promise: null };
-  entry.promise = queryFomoToken(params).finally(() => {
+  entry.promise = queryFomoToken(params, allowSessionRefresh, options).finally(() => {
     if (fomoRequestsByToken.get(key) === entry) fomoRequestsByToken.delete(key);
   });
   fomoRequestsByToken.set(key, entry);
@@ -1910,52 +2095,101 @@ function isFomoAuthError(error) {
   return ["HTTP_401", "HTTP_403", "HTTP_430"].includes(error?.message);
 }
 
+function fomoTradeMetadataKey(item) {
+  return `${item.tokenAddress.startsWith("0x") ? item.tokenAddress.toLowerCase() : item.tokenAddress}:${item.networkId}`;
+}
+
+function scheduleFomoMetadataBatch() {
+  if (fomoMetadataBatchTimer !== null || !fomoMetadataQueue.size
+    || fomoMetadataBatchesRunning >= FOMO_METADATA_CONCURRENCY) return;
+  fomoMetadataBatchTimer = setTimeout(() => {
+    fomoMetadataBatchTimer = null;
+    flushFomoMetadataBatch();
+  }, FOMO_METADATA_BATCH_MS);
+}
+
+function flushFomoMetadataBatch() {
+  if (!fomoMetadataQueue.size || fomoMetadataBatchesRunning >= FOMO_METADATA_CONCURRENCY) return;
+  const first = fomoMetadataQueue.values().next().value;
+  const entries = [];
+  for (const [key, entry] of fomoMetadataQueue) {
+    if (entry.session.authorization !== first.session.authorization
+      || entry.session.supportedChains !== first.session.supportedChains) continue;
+    fomoMetadataQueue.delete(key);
+    entries.push(entry);
+    if (entries.length === FOMO_METADATA_BATCH_SIZE) break;
+  }
+  fomoMetadataBatchesRunning += 1;
+  const request = GmgnFomoApi.buildFollowedTradesMetadataRequest(entries.map((entry) => entry.item));
+  fetchJson({ ...request, timeoutMs: FOMO_FOLLOWED_TIMEOUT_MS }, first.session).then((payload) => {
+    const metadata = new Map(GmgnFomoApi.sanitizeFollowedTradesMetadata(payload).map((item) => [item.key, item]));
+    for (const entry of entries) {
+      const item = metadata.get(entry.tokenKey) || null;
+      if (item) setBoundedCache(fomoFollowedMetadataCache, item.key,
+        { cachedAt: Date.now(), item }, FOMO_FOLLOWED_METADATA_CACHE_MS, 512);
+      else setBoundedCache(fomoMetadataMisses, entry.key,
+        { cachedAt: Date.now() }, FOMO_METADATA_NEGATIVE_CACHE_MS, 512);
+      entry.resolve(item);
+    }
+  }).catch((error) => {
+    for (const entry of entries) {
+      if (isFomoAuthError(error)) entry.reject(error);
+      else {
+        setBoundedCache(fomoMetadataMisses, entry.key,
+          { cachedAt: Date.now() }, FOMO_METADATA_NEGATIVE_CACHE_MS, 512);
+        entry.resolve(null);
+      }
+    }
+  }).finally(() => {
+    for (const entry of entries) fomoFollowedMetadataRequests.delete(entry.key);
+    fomoMetadataBatchesRunning -= 1;
+    scheduleFomoMetadataBatch();
+  });
+  scheduleFomoMetadataBatch();
+}
+
+function queryFomoTradeMetadata(item, session) {
+  const tokenKey = fomoTradeMetadataKey(item);
+  const key = JSON.stringify([session.authorization, session.supportedChains, tokenKey]);
+  const pending = fomoFollowedMetadataRequests.get(key);
+  if (pending) return pending;
+  const missed = fomoMetadataMisses.get(key);
+  if (missed && Date.now() - missed.cachedAt < FOMO_METADATA_NEGATIVE_CACHE_MS) return Promise.resolve(null);
+  // Enrichment is optional; never hold up or drop the real-time trade itself.
+  if (fomoMetadataQueue.size >= 512) return Promise.resolve(null);
+  const promise = new Promise((resolve, reject) => {
+    fomoMetadataQueue.set(key, { key, tokenKey,
+      item: { tokenAddress: item.tokenAddress, networkId: item.networkId }, session, resolve, reject });
+  });
+  fomoFollowedMetadataRequests.set(key, promise);
+  scheduleFomoMetadataBatch();
+  return promise;
+}
+
 async function enrichFomoFollowedTrades(items, session) {
-  const cachedMetadata = [];
-  const missingMetadataItems = [];
+  if (!followedTradesEnabled) return items;
+  const metadata = new Map();
+  const requests = new Map();
   for (const item of items) {
     const currentSupply = GmgnFomoCore.finiteNumber(item?.totalSupply);
     if (currentSupply !== null && currentSupply > 0 && item?.tokenImageUrl) continue;
     if (!GmgnFomoCore.validTokenAddress(item?.tokenAddress)
       || !Number.isInteger(Number(item?.networkId))) continue;
-    const key = `${item.tokenAddress.startsWith("0x") ? item.tokenAddress.toLowerCase() : item.tokenAddress}:${item.networkId}`;
+    const key = fomoTradeMetadataKey(item);
     const cached = fomoFollowedMetadataCache.get(key);
     if (cached && Date.now() - cached.cachedAt < FOMO_FOLLOWED_METADATA_CACHE_MS) {
-      cachedMetadata.push(cached.item);
-    } else {
+      metadata.set(key, cached.item);
+    } else if (!requests.has(key)) {
       if (cached) fomoFollowedMetadataCache.delete(key);
-      missingMetadataItems.push(item);
+      requests.set(key, queryFomoTradeMetadata(item, session));
     }
   }
-  let enriched = GmgnFomoApi.withFollowedTradesMetadata(items, cachedMetadata);
-  const metadataRequest = GmgnFomoApi.buildFollowedTradesMetadataRequest(missingMetadataItems);
-  if (!metadataRequest) return enriched;
-  try {
-    const requestKey = metadataRequest.body || metadataRequest.url;
-    let pending = fomoFollowedMetadataRequests.get(requestKey);
-    if (!pending) {
-      pending = fetchJson(
-        { ...metadataRequest, timeoutMs: FOMO_FOLLOWED_TIMEOUT_MS },
-        session,
-      ).then((metadataPayload) => {
-        const metadata = GmgnFomoApi.sanitizeFollowedTradesMetadata(metadataPayload);
-        for (const item of metadata) {
-          setBoundedCache(fomoFollowedMetadataCache, item.key, { cachedAt: Date.now(), item }, FOMO_FOLLOWED_METADATA_CACHE_MS, 512);
-        }
-        return metadata;
-      }).finally(() => {
-        if (fomoFollowedMetadataRequests.get(requestKey) === pending) {
-          fomoFollowedMetadataRequests.delete(requestKey);
-        }
-      });
-      fomoFollowedMetadataRequests.set(requestKey, pending);
-    }
-    const metadata = await pending;
-    enriched = GmgnFomoApi.withFollowedTradesMetadata(enriched, metadata);
-  } catch (error) {
-    if (isFomoAuthError(error)) throw error;
+  const results = await Promise.allSettled(requests.values());
+  for (const result of results) {
+    if (result.status === "fulfilled" && result.value) metadata.set(result.value.key, result.value);
+    else if (result.status === "rejected" && isFomoAuthError(result.reason)) throw result.reason;
   }
-  return enriched;
+  return GmgnFomoApi.withFollowedTradesMetadata(items, [...metadata.values()]);
 }
 
 function withCachedFomoFollowedTradesMetadata(items) {
@@ -1975,7 +2209,7 @@ function withCachedFomoFollowedTradesMetadata(items) {
   return GmgnFomoApi.withFollowedTradesMetadata(items, cachedMetadata);
 }
 
-async function fetchFomoFollowedTradePages(session) {
+async function fetchFomoFollowedTradePages(session, force = false) {
   const knownKeys = new Set(followedTradesHistory.fomo.map(GmgnFollowTrades.stableKey));
   const items = [];
   const seenCursors = new Set();
@@ -1984,7 +2218,7 @@ async function fetchFomoFollowedTradePages(session) {
     const request = GmgnFomoApi.buildFollowedTradesRequest(cursor);
     let payload;
     try {
-      payload = await fetchJson({ ...request, timeoutMs: FOMO_FOLLOWED_TIMEOUT_MS }, session);
+      payload = await fetchJson({ ...request, force, timeoutMs: FOMO_FOLLOWED_TIMEOUT_MS }, session);
     } catch (error) {
       if (page === 0 || isFomoAuthError(error)) throw error;
       break;
@@ -2003,7 +2237,16 @@ async function fetchFomoFollowedTradePages(session) {
   return GmgnFollowTrades.mergeFollowedTrades(items);
 }
 
-async function queryFomoFollowedTrades(allowSessionRefresh = true, force = false) {
+function queryFomoFollowedTrades(allowSessionRefresh = true, force = false) {
+  if (fomoAlertRestRequest) return fomoAlertRestRequest;
+  const pending = loadFomoFollowedTrades(allowSessionRefresh, force).finally(() => {
+    if (fomoAlertRestRequest === pending) fomoAlertRestRequest = null;
+  });
+  fomoAlertRestRequest = pending;
+  return pending;
+}
+
+async function loadFomoFollowedTrades(allowSessionRefresh = true, force = false) {
   if (!force && fomoAlertRestSnapshot
     && Date.now() - fomoAlertRestSnapshot.cachedAt < FOMO_ALERT_REST_CACHE_MS) {
     recordFollowedTradePipeline("fomo-rest-cache", fomoAlertRestSnapshot.items, {
@@ -2026,7 +2269,7 @@ async function queryFomoFollowedTrades(allowSessionRefresh = true, force = false
   }
   try {
     const items = await enrichFomoFollowedTrades(
-      await fetchFomoFollowedTradePages(session),
+      await fetchFomoFollowedTradePages(session, force),
       session,
     );
     fomoAlertRestSnapshot = { cachedAt: Date.now(), items };
@@ -2042,7 +2285,7 @@ async function queryFomoFollowedTrades(allowSessionRefresh = true, force = false
       if (replacement?.authorization) {
         fomoAlertRestSnapshot = null;
         ensureFomoAlertSocket(true).catch(() => {});
-        return queryFomoFollowedTrades(false, true);
+        return loadFomoFollowedTrades(false, true);
       }
     }
     recordFollowedTradePipeline("fomo-rest-error", [], {
@@ -2050,7 +2293,7 @@ async function queryFomoFollowedTrades(allowSessionRefresh = true, force = false
       error: error?.message || "FOMO_REQUEST_FAILED",
       force,
     });
-    if (isFomoAuthError(error)) {
+    if (error?.message === "HTTP_401") {
       await clearSession().catch(() => {});
       throw new Error("FOMO_SESSION_EXPIRED");
     }
@@ -2451,16 +2694,19 @@ async function queryPumpFollowing(identity, force = false) {
   return items;
 }
 
-async function queryFomoFollowState(allowSessionRefresh = true) {
+async function queryFomoFollowState(allowSessionRefresh = true, force = false) {
   const session = await getSession();
   if (!session?.authorization) throw new Error("FOMO_NOT_CONNECTED");
   try {
     const [currentUserPayload, followingPayload] = await Promise.all([
-      fetchJson(GmgnFomoApi.buildCurrentUserRequest(), session),
-      fetchJson(GmgnFomoApi.buildFollowingIdsRequest(), session),
+      fetchJson({ ...GmgnFomoApi.buildCurrentUserRequest(), cacheMs: FOMO_CURRENT_USER_CACHE_MS, force }, session),
+      fetchJson({ ...GmgnFomoApi.buildFollowingIdsRequest(), force }, session),
     ]);
     const viewerUserId = GmgnFomoApi.currentUserId(currentUserPayload);
-    if (!viewerUserId) throw new Error("FOMO_CURRENT_USER_NOT_FOUND");
+    if (!viewerUserId) {
+      fomoReadCache.clear();
+      throw new Error("FOMO_CURRENT_USER_NOT_FOUND");
+    }
     return {
       viewerUserId,
       followingIds: GmgnFomoApi.sanitizeFollowingIds(followingPayload),
@@ -2468,7 +2714,7 @@ async function queryFomoFollowState(allowSessionRefresh = true) {
   } catch (error) {
     if (error?.message === "HTTP_401" && allowSessionRefresh) {
       const replacement = await refreshSessionInBackground(session.authorization).catch(() => null);
-      if (replacement?.authorization) return queryFomoFollowState(false);
+      if (replacement?.authorization) return queryFomoFollowState(false, force);
     }
     if (error?.message === "HTTP_401") await clearSession().catch(() => {});
     throw error;
@@ -2505,7 +2751,7 @@ async function queryHolderFollowStates(force = false) {
   }
   const request = (async () => {
     const [fomoResult, pumpResult] = await Promise.allSettled([
-      queryFomoFollowState(),
+      queryFomoFollowState(true, force),
       queryPumpIdentity().then(async (identity) => ({
         identity,
         items: await queryPumpFollowing(identity, force),
@@ -2555,6 +2801,8 @@ async function mutateFomoHolderFollow(userId, shouldFollow, allowSessionRefresh 
   if (payload?.statusCode !== 200) throw new Error(shouldFollow
     ? "FOMO_FOLLOW_FAILED"
     : "FOMO_UNFOLLOW_FAILED");
+  // A local mutation must not be followed by a pre-mutation cached read.
+  fomoReadCache.clear();
   const followingIds = new Set(state.followingIds);
   if (shouldFollow) followingIds.add(userId);
   else followingIds.delete(userId);
@@ -3367,13 +3615,22 @@ function persistFollowedTradesHistory() {
   const fingerprint = followedTradesFingerprint(items);
   if (fingerprint === followedTradesCacheFingerprint) return followedTradesCacheWritePromise;
   followedTradesCacheFingerprint = fingerprint;
-  const payload = { version: 1, updatedAt: Date.now(), items };
-  const write = followedTradesCacheWritePromise.then(() => (
-    chrome.storage.local.set({ [FOLLOWED_TRADES_STORAGE_KEY]: payload })
-  )).catch((error) => {
-    if (followedTradesCacheFingerprint === fingerprint) followedTradesCacheFingerprint = "";
-    throw error;
+  followedTradesCachePendingWrite = { fingerprint, payload: { version: 1, updatedAt: Date.now(), items } };
+  if (followedTradesCacheNextWrite) return followedTradesCacheNextWrite;
+  // Each payload is a complete, already-merged history. One pending latest
+  // snapshot preserves history without retaining every intermediate version.
+  const write = followedTradesCacheWritePromise.then(async () => {
+    const next = followedTradesCachePendingWrite;
+    followedTradesCachePendingWrite = null;
+    followedTradesCacheNextWrite = null;
+    try {
+      await chrome.storage.local.set({ [FOLLOWED_TRADES_STORAGE_KEY]: next.payload });
+    } catch (error) {
+      if (followedTradesCacheFingerprint === next.fingerprint) followedTradesCacheFingerprint = "";
+      throw error;
+    }
   });
+  followedTradesCacheNextWrite = write;
   followedTradesCacheWritePromise = write.catch(() => {});
   return write;
 }
@@ -3662,6 +3919,9 @@ function recordFollowedTradePipeline(stage, items = [], detail = {}) {
     detail: sanitizeFollowedTradePipelineDetail(detail),
   };
   followedTradesPipelinePendingEvents.push(event);
+  if (followedTradesPipelinePendingEvents.length > FOLLOWED_TRADES_PIPELINE_LIMIT) {
+    followedTradesPipelinePendingEvents.splice(0, followedTradesPipelinePendingEvents.length - FOLLOWED_TRADES_PIPELINE_LIMIT);
+  }
   if (followedTradesPipelineFlushScheduled) return followedTradesPipelineWrite;
   followedTradesPipelineFlushScheduled = true;
   followedTradesPipelineWrite = followedTradesPipelineWrite.catch(() => {}).then(async () => {
@@ -4002,10 +4262,10 @@ function closeFomoAlertSocket(resetSubscriptionState = true) {
 function scheduleFomoAlertReconnect() {
   if (!followedTradesEnabled || !hasFollowedTradeConsumers()
     || fomoAlertSocketReconnectTimer !== null) return;
-  const delay = Math.min(
+  const delay = Math.min(2_147_000_000, Math.max(fomoRateLimitUntil - Date.now(), Math.min(
     FOMO_ALERT_RECONNECT_MIN_MS * (2 ** Math.min(fomoAlertSocketReconnectAttempts, 5)),
     FOMO_ALERT_RECONNECT_MAX_MS,
-  );
+  )));
   fomoAlertSocketReconnectAttempts += 1;
   fomoAlertSocketReconnectTimer = setTimeout(() => {
     fomoAlertSocketReconnectTimer = null;
@@ -4025,6 +4285,8 @@ async function waitForFomoAlertTopicId() {
 }
 
 async function captureFomoAlertTopicId() {
+  await fomoBackoffReady;
+  if (Date.now() < fomoRateLimitUntil) return "";
   const currentSession = await getSession();
   if (validFomoAlertTopicId(currentSession?.userId)) return currentSession.userId.trim();
   if (fomoAlertTopicCapturePromise) return fomoAlertTopicCapturePromise;
@@ -4312,6 +4574,7 @@ function fomoSessionExpiresSoon(authorization) {
 }
 
 async function ensureFomoAlertSocket(force = false) {
+  await fomoBackoffReady;
   if (!await getFollowedTradesEnabled() || !hasFollowedTradeConsumers()) return false;
   let session = await getSession();
   if (session?.authorization && fomoSessionExpiresSoon(session.authorization)
@@ -4337,6 +4600,10 @@ async function ensureFomoAlertSocket(force = false) {
   if (!force && fomoAlertSocket && fomoAlertSocketKey === socketKey
     && [WebSocket.CONNECTING, WebSocket.OPEN].includes(fomoAlertSocket.readyState)) {
     return true;
+  }
+  if (Date.now() < fomoRateLimitUntil) {
+    scheduleFomoAlertReconnect();
+    return false;
   }
   closeFomoAlertSocket(false);
   const generation = fomoAlertSocketGeneration;
@@ -4601,6 +4868,13 @@ function stopFollowedTradesPollingIfIdle() {
 function stopFollowedTradesAcquisition() {
   if (followedTradesPollTimer !== null) clearTimeout(followedTradesPollTimer);
   followedTradesPollTimer = null;
+  if (fomoMetadataBatchTimer !== null) clearTimeout(fomoMetadataBatchTimer);
+  fomoMetadataBatchTimer = null;
+  for (const entry of fomoMetadataQueue.values()) {
+    fomoFollowedMetadataRequests.delete(entry.key);
+    entry.resolve(null);
+  }
+  fomoMetadataQueue.clear();
   closeFomoAlertSocket();
   stopPumpNatsSubscriptions();
   for (const state of pumpNatsWalletRefreshStates.values()) {
@@ -5042,7 +5316,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   let request;
   if (message?.type === "queryFomoToken") {
-    request = queryFomoTokenShared(message.params);
+    request = queryFomoTokenShared(message.params, {
+      includeFeed: message.includeFeed !== false, force: message.force === true,
+    });
   } else if (message?.type === "resolveFomoHolderAddress") {
     request = resolveFomoHolderAddressShared(message.params, message.holder, _sender.tab?.id);
   } else if (message?.type === "resolvePumpHolderAddress") {

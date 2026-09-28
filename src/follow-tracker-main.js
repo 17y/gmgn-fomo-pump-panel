@@ -1,7 +1,7 @@
 (function installGmgnFollowThinBridge() {
   "use strict";
 
-  const BRIDGE_VERSION = "1.0.4";
+  const BRIDGE_VERSION = "1.0.5";
   const MESSAGE_CHANNEL = "gmgn-follow-trade-event-v1";
   const RETRY_OFFSETS_MS = Object.freeze([0, 100, 250, 500, 1_000, 2_000, 4_000]);
   const EVENT_TTL_MS = 5_000;

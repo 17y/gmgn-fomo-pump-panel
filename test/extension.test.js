@@ -120,7 +120,7 @@ test("Authorization 只从 Fomo 页面持久化，并在 401 后自动续期", (
   assert.match(source, /details\.initiator !== FOMO_PAGE_ORIGIN/);
   assert.match(source, /chrome\.tabs\.create\(\{ url: FOMO_PAGE_URL, active: false \}\)/);
   assert.match(source, /session\.authorization !== previousAuthorization/);
-  assert.match(source, /queryFomoToken\(params, false\)/);
+  assert.match(source, /queryFomoTokenShared\(params, \{ \.\.\.options, force: false \}, false\)/);
   assert.match(source, /chrome\.storage\.local\.remove\(SESSION_KEY\)/);
   assert.match(source, /reason === "HTTP_401"/);
   assert.doesNotMatch(source, /reason === "HTTP_401" \|\| reason === "HTTP_403"/);
@@ -431,7 +431,7 @@ test("Fomo 与 Pump Holder 头像右下角支持关注、取消关注并清理�
     assert.match(source, /Unfollow \$\{holder\.displayName\} and clear tracked trades/);
     assert.match(source, /holderAvatarControl\(holder, followControl\)/);
     assert.match(source, /if \(followControl\) wrapper\.append\(followControl\)/);
-    assert.match(source, /refreshHolderFollowStates\(firstLoadForRoute\)/);
+    assert.match(source, /refreshHolderFollowStates\(force\)/);
     assert.doesNotMatch(source, /nameLine\.append\(followControl\)/);
   }
   assert.match(styles, /\.fomo-avatar-wrap/);

@@ -157,6 +157,7 @@ test("both panel surfaces keep Solana token route identity case-sensitive", () =
   const context = vm.createContext({
     currentRoute: core.parseTokenRoute(first), currentData: null, currentPumpItems: [], requestVersion: 0,
     openFomo: {}, fomoTokenUrl: () => "", renderPendingHeader() {}, load() {}, renderIdle() {},
+    routeLoadTimer: null, ROUTE_SETTLE_MS: 300, setTimeout: () => 1, clearTimeout() {},
   });
   vm.runInContext(`${block}\nglobalThis.setRoute = setRoute;`, context);
   assert.equal(context.setRoute(core.parseTokenRoute(second)), true);
