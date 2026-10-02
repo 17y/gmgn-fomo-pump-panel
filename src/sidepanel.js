@@ -5,17 +5,20 @@
   const pumpApi = globalThis.GmgnPumpApi;
   if (!core || !pumpApi) return;
 
-  const REFRESH_MS = 5_000;
   const ROUTE_SETTLE_MS = 300;
   const TOKEN_LOAD_TIMEOUT_MS = 13_000;
   const SIDE_PANEL_HEARTBEAT_MS = 20_000;
   const SIDE_PANEL_RECONNECT_MS = 500;
   let currentRoute = null;
+  let currentTabId = null;
   let currentData = null;
   let currentPumpItems = [];
   let activeTab = "holders";
   let requestVersion = 0;
   let activeLoad = null;
+  let loadedVersion = -1;
+  let holderExtrasLoad = null;
+  let feedLoad = null;
   let routeLoadTimer = null;
   const holderCopyStates = new Map();
   const holderFollowActions = new Map();
@@ -104,7 +107,7 @@
       return holderFollowRequest.then(() => refreshHolderFollowStates(true));
     }
     holderFollowRequestForce = force;
-    holderFollowRequest = sendMessage({ type: "queryHolderFollowStates", force })
+    holderFollowRequest = sendMessage({ type: "queryHolderFollowStates", force, params: currentRoute, oncePerVisit: true, tabId: currentTabId })
       .then((result) => {
         if (result?.ok && applyHolderFollowState(result)) rerenderHolderActions();
         return result;
@@ -640,59 +643,9 @@
     content.replaceChildren(fragment);
   }
 
-  function aboutStat(label, value) {
-    const item = element("div", "fomo-about-stat");
-    item.append(element("span", "", label), element("strong", "", value));
-    return item;
-  }
-
-  function renderAbout() {
-    const { metadata, holders } = currentData;
-    const wrapper = element("div", "fomo-about");
-    wrapper.append(element("h2", "", `About ${metadata.symbol || metadata.name}`));
-    wrapper.append(element("p", "fomo-about-description", metadata.description || "No description provided by fomo.family."));
-
-    const stats = element("div", "fomo-about-grid");
-    stats.append(
-      aboutStat("Market cap", core.compactUsd(metadata.marketCap)),
-      aboutStat("Price", core.compactUsd(metadata.priceUsd, 4)),
-      aboutStat("24H volume", core.compactUsd(metadata.volume24)),
-      aboutStat("Liquidity", core.compactUsd(metadata.liquidity)),
-      aboutStat("Holders", core.compactNumber(holders.totalHolders)),
-      aboutStat(
-        holders.isFomoPositionValueComplete ? "Fomo positions" : "Fomo top positions",
-        core.compactUsd(holders.fomoPositionValue),
-      ),
-      ...(core.finiteNumber(holders.fomoOwnershipPercent) === null ? [] : [aboutStat(
-        holders.isFomoOwnershipComplete ? "Fomo ownership" : "Fomo Top 100 ownership",
-        core.holdingPercent(holders.fomoOwnershipPercent),
-      )]),
-      aboutStat("Supply", core.compactNumber(metadata.totalSupply)),
-    );
-    wrapper.append(stats);
-
-    const details = element("div", "fomo-about-details");
-    details.append(aboutStat("Network", currentRoute.fomoChain));
-    if (metadata.launchpad.name) details.append(aboutStat("Launchpad", metadata.launchpad.name));
-    details.append(aboutStat("Contract address", `${metadata.address.slice(0, 8)}…${metadata.address.slice(-6)}`));
-    wrapper.append(details);
-
-    const links = element("div", "fomo-socials");
-    for (const [name, url] of Object.entries(metadata.socialLinks)) {
-      const link = element("a", "", name === "twitter" ? "X / Twitter" : `${name[0].toUpperCase()}${name.slice(1)}`);
-      link.href = url;
-      link.target = "_blank";
-      link.rel = "noopener noreferrer";
-      links.append(link);
-    }
-    wrapper.append(links);
-    content.replaceChildren(wrapper);
-  }
-
   function renderActiveTab() {
     if (!currentData) return;
     if (activeTab === "feed") renderFeed();
-    else if (activeTab === "about") renderAbout();
     else renderHolders();
   }
 
@@ -760,7 +713,10 @@
       routeLoadTimer = null;
     }
     if (activeLoad?.version === requestVersion) return activeLoad.promise;
+    if (!force && loadedVersion === requestVersion) return loadPanelSection();
     const version = requestVersion;
+    const route = currentRoute;
+    const tabId = currentTabId;
     const entry = { version, promise: null };
     if (!silent) {
       status.textContent = "Loading fomo.family…";
@@ -768,45 +724,24 @@
     }
     entry.promise = (async () => {
       try {
-        const route = currentRoute;
         const result = await sendMessage({
           type: "queryFomoToken",
           params: { address: route.address, networkId: route.networkId },
-          includeFeed: activeTab === "feed",
-          force,
+          tabId, oncePerVisit: true, includeFeed: false, force,
         });
         if (version !== requestVersion || !currentRoute) return;
+        loadedVersion = version;
         if (!result?.ok) return renderError(result?.error);
-        const fomoData = result.data;
-        const updatedAt = result.cached ? result.cachedAt : Date.now();
+        if (force) { holderExtrasLoad = null; feedLoad = null; }
+        const updatedAt = result.cached ? result.cachedAt : result.updatedAt || Date.now();
         const label = result.cached ? "Cached" : result.partial ? "Partially updated" : "Updated";
-        const updatedLabel = `${label} ${new Date(updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
-        currentData = withPumpItems(fomoData, currentPumpItems);
+        currentData = withPumpItems(result.data, currentPumpItems);
         renderHeader(currentData.metadata);
         renderActiveTab();
-        status.textContent = updatedLabel;
-        if (activeTab !== "holders") return;
-        if (typeof refreshHolderFollowStates === "function") {
-          refreshHolderFollowStates(force);
-        }
-
-        const pumpResult = await sendMessage({
-          type: "queryPumpHolders",
-          params: { address: route.address, networkId: route.networkId },
-          metadata: fomoData.metadata,
-        }).catch(() => null);
-        if (version !== requestVersion || !currentRoute) return;
-        const hadPumpItems = currentPumpItems.length > 0;
-        if (pumpResult?.ok) {
-          currentPumpItems = Array.isArray(pumpResult.items) ? pumpResult.items : [];
-        }
-        currentData = withPumpItems(fomoData, currentPumpItems);
-        const animatePump = !hadPumpItems && currentPumpItems.length > 0;
-        if (pumpResult?.ok && activeTab === "holders") {
-          renderHolders(animatePump);
-        }
+        status.textContent = `${label} ${new Date(updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
+        loadPanelSection(force);
       } catch (error) {
-        if (version === requestVersion) renderError(error?.message);
+        if (version === requestVersion) { loadedVersion = version; renderError(error?.message); }
       }
     })().finally(() => {
       if (activeLoad === entry) activeLoad = null;
@@ -815,11 +750,47 @@
     return entry.promise;
   }
 
-  function setRoute(route) {
-    const nextKey = route ? `${route.chain}:${route.address}` : "";
-    const currentKey = currentRoute ? `${currentRoute.chain}:${currentRoute.address}` : "";
+  function loadPanelSection(force = false) {
+    if (!currentData || !currentRoute) return Promise.resolve();
+    const version = requestVersion, route = currentRoute, data = currentData;
+    if (activeTab === "feed") {
+      if (!force && feedLoad?.version === version) return feedLoad.promise;
+      const entry = { version, promise: null };
+      entry.promise = sendMessage({ type: "queryFomoFeed", params: {
+        address: route.address, networkId: route.networkId,
+      }, tabId: currentTabId, oncePerVisit: true, force }).then(result => {
+        if (version !== requestVersion || !currentData || feedLoad !== entry) return;
+        if (!result?.ok) { status.textContent = result?.error || "FOMO_FEED_FAILED"; return; }
+        currentData = { ...currentData, feed: result.items };
+        if (activeTab === "feed") renderFeed();
+      }).catch(error => { if (version === requestVersion) status.textContent = error?.message || "FOMO_FEED_FAILED"; });
+      feedLoad = entry;
+      return entry.promise;
+    }
+    if (!force && holderExtrasLoad?.version === version) return holderExtrasLoad.promise;
+    const entry = { version, promise: null };
+    entry.promise = (async () => {
+      refreshHolderFollowStates(force);
+      const result = await sendMessage({ type: "queryPumpHolders", params: {
+        address: route.address, networkId: route.networkId,
+      }, metadata: data.metadata, tabId: currentTabId, oncePerVisit: true, force }).catch(() => null);
+      if (version !== requestVersion || !currentData || holderExtrasLoad !== entry) return;
+      const hadItems = currentPumpItems.length > 0;
+      if (result?.ok) currentPumpItems = Array.isArray(result.items) ? result.items : [];
+      currentData = withPumpItems(currentData, currentPumpItems);
+      if (result?.ok && activeTab === "holders") renderHolders(!hadItems && currentPumpItems.length > 0);
+    })();
+    holderExtrasLoad = entry;
+    return entry.promise;
+  }
+
+  function setRoute(route, tabId = currentTabId) {
+    const nextKey = route ? `${tabId}:${route.chain}:${route.address}` : "";
+    const currentKey = currentRoute ? `${currentTabId}:${currentRoute.chain}:${currentRoute.address}` : "";
     if (nextKey === currentKey) return false;
     currentRoute = route || null;
+    currentTabId = tabId;
+    holderExtrasLoad = null; feedLoad = null;
     currentData = null;
     currentPumpItems = [];
     requestVersion += 1;
@@ -848,11 +819,11 @@
     }
   }
 
-  async function syncActiveTab(refreshCurrent = false) {
+  async function syncActiveTab() {
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      const changed = setRoute(routeFromUrl(tab?.url));
-      if (refreshCurrent && !changed && currentRoute) load(true);
+      const changed = setRoute(routeFromUrl(tab?.url), tab?.id ?? null);
+      if (!changed && currentRoute) load(true);
     } catch {
       setRoute(null);
     }
@@ -914,7 +885,8 @@
       .catch(() => {})
       .finally(() => {
         if (version !== requestVersion || currentRoute !== route || !currentRoute) return;
-        load(true);
+        if (!currentData) { loadedVersion = -1; load(true); }
+        else refreshHolderFollowStates(true);
       });
   }
 
@@ -927,7 +899,7 @@
       renderActiveTab();
       const tab = activeTab;
       const version = requestVersion;
-      if (tab !== "about") Promise.resolve(activeLoad?.promise).catch(() => {}).then(() => {
+      Promise.resolve(activeLoad?.promise).catch(() => {}).then(() => {
         if (version === requestVersion && activeTab === tab && currentRoute) load(true);
       });
     });
@@ -941,16 +913,19 @@
       reloadAfterFomoSessionChange();
     }
   });
-  chrome.tabs.onActivated.addListener(syncActiveTab);
+  chrome.tabs.onActivated.addListener(() => syncActiveTab());
   chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
-    if (tab.active && changeInfo.url) setRoute(routeFromUrl(changeInfo.url));
+    if (!tab.active) return;
+    if (changeInfo.status === "loading") setRoute(null, tab.id);
+    else if (changeInfo.status === "complete") syncActiveTab();
+    else if (changeInfo.url) setRoute(routeFromUrl(changeInfo.url), tab.id);
   });
   document.addEventListener("visibilitychange", (event) => {
     if (!event.isTrusted) return;
     if (document.visibilityState === "visible") {
       refreshTrackingToggle();
       refreshPumpNotice();
-      syncActiveTab(true);
+      syncActiveTab();
     }
   });
 
@@ -959,9 +934,5 @@
   refreshPumpNotice();
   connectVisibilityPort();
   syncActiveTab();
-  setInterval(() => {
-    if (document.visibilityState !== "visible") return;
-    refreshPumpNotice();
-    if (currentRoute) load(true);
-  }, REFRESH_MS);
+
 })();

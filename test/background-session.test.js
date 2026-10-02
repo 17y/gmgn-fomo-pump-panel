@@ -102,6 +102,7 @@ function createHarness({
   gmgnStatus = 200,
   gmgnPageStatus = 200,
   gmgnPagePayload = null,
+  gmgnMetadataPayload = null, gmgnVisitId = null,
   blockscoutStatus = 200,
   blockscoutPayload = null,
   rpcPayload = null,
@@ -148,6 +149,7 @@ function createHarness({
   }
   const sessionData = receiptSessionData ? { followedTradeReceiptsV1: receiptSessionData } : {};
   if (backoffState) sessionData.fomoApiBackoffV1 = backoffState;
+  const gmgnMetadataRequests = [];
   const fomoBodies = [];
   const requestedAuthorizations = [];
   const requestedUrls = [];
@@ -236,7 +238,12 @@ function createHarness({
         && [250, 1_000, 2_000, 5_000].includes(effectiveDelay)
         ? 5
         : effectiveDelay;
-      const timer = setTimeout(handler, pumpDelay, ...args);
+      const metadataTimer = String(handler).includes("flushFomoMetadataBatch()");
+      const dueAt = clockNow + delay;
+      const timer = setTimeout(metadataTimer ? () => {
+        clockNow = Math.max(clockNow, dueAt);
+        handler(...args);
+      } : handler, metadataTimer ? 5 : pumpDelay, ...args);
       scheduledTimers.set(timer, { handler, delay });
       harnessTimers.add(timer);
       return timer;
@@ -593,6 +600,13 @@ function createHarness({
     },
     scripting: {
       async executeScript(details) {
+        if (String(details?.func).includes("__gmgnFomoDetailVisit")) return [{ result: gmgnVisitId }];
+        if (String(details?.func).includes("__gmgnFollowTokenMetadata")) {
+          const [chain, addresses] = details.args;
+          gmgnMetadataRequests.push({ chain, addresses, at: clockNow });
+          return [{ result: typeof gmgnMetadataPayload === "function"
+            ? await gmgnMetadataPayload(chain, addresses) : gmgnMetadataPayload || [] }];
+        }
         const requestUrl = details?.args?.[0];
         if (typeof requestUrl === "string" && requestUrl.startsWith("https://frontend-api-v3.pump.fun/")) {
           pumpRequestCount += 1;
@@ -638,6 +652,9 @@ function createHarness({
         const urls = Array.isArray(details.url) ? details.url : [details.url];
         if (urls.some((url) => String(url || "").startsWith("https://pump.fun/"))) {
           return [...createdTabs.values()].filter((tab) => String(tab.url || "").startsWith("https://pump.fun/"));
+        }
+        if (gmgnMetadataPayload !== null && urls.some(url => String(url).startsWith("https://gmgn.ai/"))) {
+          return [{ id: 90, url: "https://gmgn.ai/bsc/token/0x1111111111111111111111111111111111111111", active: true }];
         }
         return [];
       },
@@ -690,7 +707,9 @@ function createHarness({
   vm.runInNewContext(fs.readFileSync("src/background.js", "utf8"), context);
 
   return {
-    actionState,
+    actionState, gmgnMetadataRequests,
+    setDetailDocument(id) { gmgnVisitId = id; },
+    message(message, sender = {}) { return new Promise(resolve => messageListener(message, sender, resolve)); },
     closePumpPages() { createdTabs.clear(); },
     createdTabCount: () => createdTabCount,
     createdTabDetails,
@@ -1590,7 +1609,7 @@ test("当前多链列表时间门槛只限制页面展示，不删除跨刷新�
   );
 });
 
-test("Fomo 追踪通过 Fomo metadata 补总供应量并保留交易市值", async () => {
+test("Fomo 追踪通过 GMGN metadata 补总供应量并保留交易市值", async () => {
   const token = "0x7777777777777777777777777777777777777777";
   const key = `${token}:${core.TOKEN_NETWORK_IDS.robinhood}`;
   const trade = {
@@ -1607,6 +1626,7 @@ test("Fomo 追踪通过 Fomo metadata 补总供应量并保留交易市值", asy
     initialAuthorization: "stable-token",
     responseStatus: () => 200,
     pumpStatus: 503,
+    gmgnMetadataPayload: (chain, addresses) => addresses.map(address => ({ chain, address, total_supply: 1_000_000_000 })),
     responsePayload: (url) => {
       if (url.includes("/feed/tradingActivity?")) return { trades: [trade] };
       if (url.endsWith("/proxy/filterTokens")) {
@@ -1616,15 +1636,18 @@ test("Fomo 追踪通过 Fomo metadata 补总供应量并保留交易市值", asy
     },
   });
 
+  const first = await harness.queryFollowedTrades(core.TOKEN_NETWORK_IDS.robinhood);
+  assert.equal(first.ok, true);
+  assert.equal(first.items[0].totalSupply, null);
+  await new Promise(resolve => setTimeout(resolve, 40));
   const result = await harness.queryFollowedTrades(core.TOKEN_NETWORK_IDS.robinhood);
-
-  assert.equal(result.ok, true);
   assert.equal(result.items[0].totalSupply, 1_000_000_000);
   assert.equal(result.items[0].marketCapAtTrade, 367_700);
-  assert.equal(harness.fomoRequestCount(), 2);
+  assert.equal(harness.fomoRequestCount(), 1);
+  assert.equal(harness.gmgnMetadataRequests.length, 1);
 });
 
-test("Fomo 交易已有供应量但缺图片时仍请求 token metadata 补图", async () => {
+test("Fomo 交易已有供应量但缺图片时通过 GMGN metadata 补图", async () => {
   const token = "0xbd99c569001bd6bad33f5cd954c6fadaf4298201";
   const key = `${token}:${core.TOKEN_NETWORK_IDS.robinhood}`;
   const image = "https://ipfs.io/ipfs/bafkreiduxzar2onubb6oudbuibb7vip6am6nujj3sau6iftolmzt3rycaa";
@@ -1642,6 +1665,7 @@ test("Fomo 交易已有供应量但缺图片时仍请求 token metadata 补图",
     initialAuthorization: "stable-token",
     responseStatus: () => 200,
     pumpStatus: 503,
+    gmgnMetadataPayload: (chain, addresses) => addresses.map(address => ({ chain, address, total_supply: 1_000_000_000, logo: image })),
     responsePayload: (url) => {
       if (url.includes("/feed/tradingActivity?")) return { trades: [trade] };
       if (url.endsWith("/proxy/filterTokens")) {
@@ -1651,11 +1675,13 @@ test("Fomo 交易已有供应量但缺图片时仍请求 token metadata 补图",
     },
   });
 
+  const first = await harness.queryFollowedTrades(core.TOKEN_NETWORK_IDS.robinhood);
+  assert.equal(first.ok, true);
+  await new Promise(resolve => setTimeout(resolve, 40));
   const result = await harness.queryFollowedTrades(core.TOKEN_NETWORK_IDS.robinhood);
-
-  assert.equal(result.ok, true);
   assert.equal(result.items[0].tokenImageUrl, image);
-  assert.equal(harness.fomoRequestCount(), 2);
+  assert.equal(harness.fomoRequestCount(), 1);
+  assert.equal(harness.gmgnMetadataRequests.length, 1);
 });
 
 test("Fomo Alerts REST 超时会中止，不阻塞已就绪的 Pump 消息", async () => {
@@ -2116,6 +2142,7 @@ test("Fomo 元数据请求未结束时，后续实时交易仍立即投递", asy
   const gate = new Promise((resolve) => { releaseMetadata = resolve; });
   const harness = createHarness({
     initialAuthorization: "Bearer fomo-jwt", responseStatus: () => 200, pumpStatus: 503,
+    gmgnMetadataPayload: () => { metadataRequested = true; return gate; },
     responsePayload: (url) => {
       if (url.includes("/proxy/filterTokens")) {
         metadataRequested = true;
@@ -2141,8 +2168,9 @@ test("Fomo 元数据请求未结束时，后续实时交易仍立即投递", asy
     assert.deepEqual(port.drainMessages().map((message) => message.item.id), ["first", "second"]);
     await new Promise((resolve) => setTimeout(resolve, 40));
     assert.equal(metadataRequested, true);
+    assert.equal(harness.requestedUrls.filter(url => url.includes("filterTokens")).length, 0);
   } finally {
-    releaseMetadata({ tradeMetadata: [] });
+    releaseMetadata([]);
     port.disconnect();
     await new Promise((resolve) => setImmediate(resolve));
   }
@@ -2155,6 +2183,8 @@ test("Fomo WebSocket 原始 swap 在同一流水线计算成交价并补齐成�
   const harness = createHarness({
     initialAuthorization: "Bearer fomo-jwt",
     responseStatus: () => 200,
+    gmgnMetadataPayload: (chain, addresses) => addresses.map(address => ({ chain, address,
+      symbol: "LIVE", name: "Live Token", logo: "https://example.com/live.png", total_supply: 1_000_000_000 })),
     responsePayload: (url) => {
       if (url.includes("/feed/tradingActivity?")) return { trades: [] };
       if (url.includes("/proxy/filterTokens")) {
@@ -5300,32 +5330,32 @@ test("Fomo reconnect and diagnostic catch-up share one in-flight REST request", 
 const metadataTestItem = (i) => ({ tokenAddress: `0x${i.toString(16).padStart(40, "0")}`,
   networkId: 56, totalSupply: null, tokenImageUrl: "" });
 
-test("Fomo batches overlapping metadata requests and briefly caches empty results", async () => {
-  const h = createHarness({ initialAuthorization: "stable", responseStatus: () => 200 });
+test("GMGN batches overlapping metadata requests and caches empty results for five minutes", async () => {
+  const h = createHarness({ initialAuthorization: "stable", responseStatus: () => 200, gmgnMetadataPayload: () => [] });
   await Promise.all(Array.from({ length: 20 }, (_, i) => h.enrichFomo([metadataTestItem(i + 1)])));
-  assert.equal(h.fomoRequestCount(), 1);
-  assert.equal(JSON.parse(h.fomoBodies[0]).length, 20);
+  assert.equal(h.gmgnMetadataRequests.length, 1);
+  assert.equal(h.gmgnMetadataRequests[0].addresses.length, 20);
   await h.enrichFomo([metadataTestItem(1)]);
-  assert.equal(h.fomoRequestCount(), 1);
-  h.advanceTime(15_001);
+  assert.equal(h.gmgnMetadataRequests.length, 1);
+  h.advanceTime(300_001);
   await Promise.all([h.enrichFomo([metadataTestItem(1), metadataTestItem(2)]),
     h.enrichFomo([metadataTestItem(2), metadataTestItem(3)])]);
-  assert.equal(h.fomoRequestCount(), 2);
-  assert.equal(JSON.parse(h.fomoBodies[1]).length, 3);
+  assert.equal(h.gmgnMetadataRequests.length, 2);
+  assert.equal(h.gmgnMetadataRequests[1].addresses.length, 3);
 });
 
-test("Fomo metadata batch concurrency is bounded while every requested token completes", async () => {
+test("GMGN metadata batch concurrency is bounded while every requested token completes", async () => {
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
   const h = createHarness({ initialAuthorization: "stable", responseStatus: () => 200,
-    responsePayload: () => gate });
+    gmgnMetadataPayload: () => gate });
   const pending = Promise.all(Array.from({ length: 130 }, (_, i) => h.enrichFomo([metadataTestItem(i + 1)])));
   await new Promise((resolve) => setTimeout(resolve, 85));
-  assert.equal(h.fomoRequestCount(), 2);
-  assert.ok(h.fomoBodies.every((body) => JSON.parse(body).length <= 50));
-  release({ responseObject: [] });
+  assert.equal(h.gmgnMetadataRequests.length, 1);
+  assert.ok(h.gmgnMetadataRequests.every(request => request.addresses.length <= 50));
+  release([]);
   assert.equal((await pending).length, 130);
-  assert.equal(h.fomoRequestCount(), 3);
+  assert.equal(h.gmgnMetadataRequests.length, 3);
 });
 
 test("Fomo access cooldown preserves an existing live stream but suppresses new connections", async () => {
@@ -5412,4 +5442,88 @@ test("manual follow refresh bypasses short reads and cached failures in the publ
   followingIds = ["recovered"];
   assert.deepEqual(Array.from((await h.queryHolderFollowStates(true)).states.fomo), ["recovered"], "explicit refresh also bypasses cached transient failures");
   assert.equal(h.localSetCalls.some(entry => Object.keys(entry).some(key => /Diagnostic|Pipeline|Receipts/.test(key))), false);
+});
+
+test("detail visits reuse token and following reads across idle time and overlay/side-panel callers", async () => {
+  const h = createHarness({ initialAuthorization: "stable", responseStatus: () => 200, gmgnVisitId: "document-one",
+    responsePayload: url => url.endsWith("/v2/users/current") ? { responseObject: { id: "viewer-user" } } : { responseObject: [] } });
+  const params = metadataTestItem(1), options = { oncePerVisit: true, tabId: 90, includeFeed: false };
+  const tokenParams = { address: params.tokenAddress, networkId: 56 };
+  for (let i = 0; i < 12; i++) {
+    if (i) h.advanceTime(5000);
+    assert.equal((await h.query(tokenParams, options)).ok, true);
+    assert.equal((await h.message({ type: "queryHolderFollowStates", params: tokenParams, ...options })).ok, true);
+  }
+  assert.equal(h.fomoRequestCount(), 4, "one metadata, holders, following and current-user read; no five-second polling");
+  const fromOverlay = await h.message({ type: "queryFomoToken", params: tokenParams, ...options }, { tab: { id: 90 } });
+  assert.equal(fromOverlay.ok, true); assert.equal(h.fomoRequestCount(), 4);
+  h.setDetailDocument("document-two");
+  await h.query(tokenParams, options);
+  assert.equal(h.fomoRequestCount(), 6, "a new visit still loads current token data");
+});
+
+test("Feed reads only its own endpoint, once per visit or explicit refresh", async () => {
+  const h = createHarness({ initialAuthorization: "stable", responseStatus: () => 200, gmgnVisitId: "doc" });
+  const query = { type: "queryFomoFeed", params: { address: metadataTestItem(1).tokenAddress, networkId: 56 }, oncePerVisit: true, tabId: 90 };
+  assert.equal((await h.message(query)).ok, true);
+  h.advanceTime(60_000); await h.message(query);
+  assert.equal(h.fomoRequestCount(), 1);
+  await h.message({ ...query, force: true });
+  assert.equal(h.fomoRequestCount(), 2);
+  assert.ok(h.requestedUrls.every(url => url.endsWith("/feed")));
+});
+
+test("GMGN enrichment errors retry briefly without touching Fomo authentication or sending Fomo HTTP", async () => {
+  const h = createHarness({ initialAuthorization: "stable", responseStatus: () => 200,
+    gmgnMetadataPayload: () => { throw new Error("HTTP_401"); } });
+  await h.enrichFomo([metadataTestItem(1)]);
+  h.advanceTime(14_999); await h.enrichFomo([metadataTestItem(1)]);
+  assert.equal(h.gmgnMetadataRequests.length, 1);
+  h.advanceTime(2); await h.enrichFomo([metadataTestItem(1)]);
+  assert.equal(h.gmgnMetadataRequests.length, 2);
+  assert.equal(h.fomoRequestCount(), 0);
+  assert.equal(h.localData[SESSION_KEY].authorization, "stable");
+  assert.equal(h.createdTabCount(), 0);
+});
+
+test("GMGN public metadata stays cached for ten minutes and batches separate the same address on two chains", async () => {
+  const h = createHarness({ initialAuthorization: "stable", responseStatus: () => 200,
+    gmgnMetadataPayload: (chain, addresses) => addresses.map(address => ({ chain, address,
+      total_supply: 1_000_000, logo: "https://example.com/token.png", symbol: chain })) });
+  const a = metadataTestItem(1), b = { ...a, networkId: 8453 };
+  const [x, y] = await Promise.all([h.enrichFomo([a]), h.enrichFomo([b])]);
+  assert.equal(x[0].tokenSymbol, "bsc"); assert.equal(y[0].tokenSymbol, "base");
+  assert.equal(h.gmgnMetadataRequests.length, 2);
+  assert.ok(h.gmgnMetadataRequests[1].at - h.gmgnMetadataRequests[0].at >= 5000);
+  h.advanceTime(60_001); await h.enrichFomo([a]);
+  assert.equal(h.gmgnMetadataRequests.length, 2);
+  h.advanceTime(540_000); await h.enrichFomo([a]);
+  assert.equal(h.gmgnMetadataRequests.length, 3);
+  assert.equal(h.fomoRequestCount(), 0);
+});
+
+test("Fomo REST catch-up delivers the new trade while GMGN metadata hangs, then updates without another notification", async () => {
+  let items = [], release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const h = createHarness({ initialAuthorization: "stable", responseStatus: () => 200, pumpStatus: 503,
+    gmgnMetadataPayload: () => gate,
+    responsePayload: url => url.includes("tradingActivity") ? { trades: items } : { responseObject: [] } });
+  await h.queryFollowedTrades();
+  h.advanceTime(60_001);
+  items = [{ ...metadataTestItem(1), id: "rest-delivered-first", platform: "fomo", type: "buy", createdAt: h.now(),
+    usdAmount: 25, baseAmount: 100 }];
+  const result = await Promise.race([h.queryFollowedTrades(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("REST_WAITED_FOR_METADATA")), 100))]);
+  assert.equal(result.items[0].id, items[0].id);
+  assert.equal(result.notificationItemKeys.length, 1);
+  assert.equal(result.items[0].totalSupply, null);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(h.gmgnMetadataRequests.length, 1);
+  release([{ chain: "bsc", address: items[0].tokenAddress, total_supply: 1000, logo: "https://example.com/token.png" }]);
+  await new Promise(resolve => setImmediate(resolve));
+  const updated = await h.queryFollowedTrades();
+  assert.equal(updated.items[0].totalSupply, 1000);
+  assert.equal(updated.items[0].marketCapAtTrade, 250);
+  assert.equal(updated.notificationItemKeys.length, 0);
+  assert.equal(h.requestedUrls.filter(url => url.includes("filterTokens")).length, 0);
 });

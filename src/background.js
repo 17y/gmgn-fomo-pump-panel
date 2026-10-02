@@ -27,11 +27,14 @@ const FOMO_REQUEST_TIMEOUT_MS = 10_000;
 const FOMO_SHARED_REQUEST_MAX_AGE_MS = FOMO_REQUEST_TIMEOUT_MS + 2_000;
 const FOMO_FEED_INITIAL_WAIT_MS = 750;
 const FOMO_FOLLOWED_TIMEOUT_MS = 10_000;
-const FOMO_FOLLOWED_METADATA_CACHE_MS = 60_000;
+const FOMO_FOLLOWED_METADATA_CACHE_MS = 10 * 60_000;
 const FOMO_METADATA_NEGATIVE_CACHE_MS = 15_000;
-const FOMO_METADATA_BATCH_MS = 25;
+const GMGN_METADATA_NEGATIVE_CACHE_MS = 5 * 60_000;
+const GMGN_METADATA_RETRY_MS = 15_000;
+const GMGN_METADATA_INTERVAL_MS = 5_000;
+const FOMO_METADATA_BATCH_MS = 250;
 const FOMO_METADATA_BATCH_SIZE = 50;
-const FOMO_METADATA_CONCURRENCY = 2;
+const FOMO_METADATA_CONCURRENCY = 1;
 const FOMO_READ_CACHE_MS = 1_000;
 const FOMO_READ_CACHE_BUDGET = 2 * 1024 * 1024;
 const FOMO_READ_CACHE_ENTRY_BUDGET = 256 * 1024;
@@ -92,6 +95,7 @@ const gmgnFollowTradeEventPorts = new Set();
 const visibleGmgnTradePorts = new Set();
 const gmgnHistoryRequestsByPort = new WeakMap();
 const fomoRequestsByToken = new Map();
+const detailVisitsByTab = new Map();
 const pumpQuoteQueue = new Map();
 const pumpQuoteAttempts = new Map();
 const pumpQuoteProfileRequests = new Map();
@@ -154,6 +158,7 @@ const fomoMetadataQueue = new Map();
 const fomoMetadataMisses = new Map();
 let fomoMetadataBatchTimer = null;
 let fomoMetadataBatchesRunning = 0;
+let gmgnMetadataLastBatchAt = -Infinity;
 let fomoAlertRestRequest = null;
 let fomoAlertRestSnapshot = null;
 let fomoAlertSocket = null;
@@ -419,6 +424,7 @@ function resetPumpAccountCaches() {
   pumpFollowingSnapshot = null;
   pumpProfileFollowingSnapshot = null;
   holderFollowSnapshot = null;
+  invalidateDetailFollowStates();
   pumpProfileTradesSnapshot = null;
   followedTradesHistory.pump = [];
 }
@@ -672,7 +678,10 @@ function headerValue(headers, name) {
 }
 
 async function notifyFomoSessionChanged() {
-  await chrome.runtime.sendMessage({ type: "fomoSessionChanged" }).catch(() => {});
+  const message = { type: "fomoSessionChanged" };
+  await chrome.runtime.sendMessage(message).catch(() => {});
+  const tabs = await chrome.tabs.query({ url: ["https://gmgn.ai/*", "https://www.gmgn.ai/*"] }).catch(() => []);
+  await Promise.allSettled(tabs.map(tab => chrome.tabs.sendMessage(tab.id, message)));
 }
 
 function updateFomoSession(patch) {
@@ -685,6 +694,7 @@ function updateFomoSession(patch) {
     );
     if (authorizationChanged) {
       holderFollowSnapshot = null;
+      detailVisitsByTab.clear();
       fomoReadCache.clear();
       fomoReadFailures.clear();
     }
@@ -730,6 +740,7 @@ async function getSession() {
 }
 
 async function clearSession() {
+  detailVisitsByTab.clear();
   closeFomoAlertSocket();
   fomoAlertRestSnapshot = null;
   holderFollowSnapshot = null;
@@ -1721,6 +1732,136 @@ function queryFomoTokenShared(params, options = {}, allowSessionRefresh = true) 
   return entry.promise;
 }
 
+// One bounded snapshot per open detail document, shared by the overlay and
+// side panel. Focus/tab changes do not refresh it; a route change or explicit
+// refresh does. No timer, browser storage, or trade-delivery work is involved.
+async function detailVisit(params, sender, options) {
+  if (!options.oncePerVisit) return null;
+  const tabId = sender.tab?.id ?? options.tabId;
+  if (!Number.isInteger(tabId)) return null;
+  const chain = Object.entries(GmgnFomoCore.TOKEN_NETWORK_IDS)
+    .find(([, id]) => id === params.networkId)?.[0];
+  if (!chain || !GmgnFomoCore.validTokenAddress(params.address)) throw new Error("INVALID_TOKEN");
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (expectedChain, expectedAddress) => {
+      if (!/^https:\/\/(?:www\.)?gmgn\.ai$/.test(location.origin)) return null;
+      const match = location.pathname.match(/^\/([a-z0-9_-]+)\/token\/([^/?#]+)/i);
+      if (!match) return null;
+      let address;
+      try { address = decodeURIComponent(match[2]); } catch { return null; }
+      if (address.startsWith("0x")) address = address.toLowerCase();
+      if (match[1].toLowerCase() !== expectedChain || address !== expectedAddress) return null;
+      if (!globalThis.__gmgnFomoDetailVisitTracking) {
+        globalThis.__gmgnFomoDetailVisitTracking = true;
+        const changed = () => {
+          const route = location.pathname.match(/^\/([a-z0-9_-]+)\/token\/([^/?#]+)/i);
+          let address = "";
+          try { address = route ? decodeURIComponent(route[2]) : ""; } catch {}
+          if (address.startsWith("0x")) address = address.toLowerCase();
+          const key = route ? `${route[1].toLowerCase()}:${address}` : "";
+          if (globalThis.__gmgnFomoDetailVisit?.key !== key) {
+            globalThis.__gmgnFomoDetailVisit = { key, id: crypto.randomUUID() };
+          }
+        };
+        window.addEventListener("popstate", changed);
+        window.navigation?.addEventListener?.("navigatesuccess", changed);
+      }
+      const key = `${expectedChain}:${address}`;
+      if (globalThis.__gmgnFomoDetailVisit?.key !== key) {
+        globalThis.__gmgnFomoDetailVisit = { key, id: crypto.randomUUID() };
+      }
+      return globalThis.__gmgnFomoDetailVisit.id;
+    },
+    args: [chain, params.address.startsWith("0x") ? params.address.toLowerCase() : params.address],
+  });
+  const id = results?.[0]?.result;
+  if (typeof id !== "string" || !id || id.length > 100) throw new Error("DETAIL_ROUTE_CHANGED");
+  const session = await getSession();
+  const previous = detailVisitsByTab.get(tabId);
+  const token = tokenCacheId(params);
+  if (previous?.id === id && previous.token === token && previous.authorization === session?.authorization) return previous;
+  const entry = { id, token, authorization: session?.authorization, parts: new Map() };
+  detailVisitsByTab.delete(tabId);
+  detailVisitsByTab.set(tabId, entry);
+  trimDetailVisits();
+  return entry;
+}
+
+function trimDetailVisits() {
+  const weight = () => [...detailVisitsByTab.values()].reduce((sum, visit) => sum
+    + [...visit.parts.values()].reduce((total, part) => total + (part.weight || 0), 0), 0);
+  while (detailVisitsByTab.size > 8 || weight() > FOMO_READ_CACHE_BUDGET) {
+    detailVisitsByTab.delete(detailVisitsByTab.keys().next().value);
+  }
+}
+
+async function queryDetailPart(params, sender, options, name, loader) {
+  const visit = await detailVisit(params, sender, options);
+  if (!visit) return loader();
+  const previous = visit.parts.get(name);
+  if (previous?.promise) return previous.promise;
+  if (!options.force && previous?.result) return previous.result;
+  if (options.force && name === "token") {
+    for (const part of ["feed", "pump", "follow"]) visit.parts.delete(part);
+  }
+  const entry = { promise: null, result: null, weight: 0 };
+  entry.promise = loader().then(result => {
+    const value = { ...result, updatedAt: Date.now() };
+    const weight = cacheValueWeight(value, FOMO_READ_CACHE_ENTRY_BUDGET);
+    if (Number.isFinite(weight)) { entry.result = value; entry.weight = weight; }
+    trimDetailVisits();
+    return value;
+  }).finally(() => { entry.promise = null; });
+  visit.parts.set(name, entry);
+  return entry.promise;
+}
+
+async function queryFomoFeed(params, force = false, allowSessionRefresh = true) {
+  const session = await getSession();
+  if (!session?.authorization) throw new Error("FOMO_NOT_CONNECTED");
+  try {
+    const request = GmgnFomoApi.buildRequests(params).feed;
+    const payload = await fetchJson({ ...request, force }, session);
+    return { ok: true, items: GmgnFomoApi.sanitizeFeed(payload) };
+  } catch (error) {
+    if (error?.message === "HTTP_401" && allowSessionRefresh) {
+      const replacement = await refreshSessionInBackground(session.authorization).catch(() => null);
+      if (replacement?.authorization) return queryFomoFeed(params, false, false);
+    }
+    throw error;
+  }
+}
+
+async function fetchGmgnTradeMetadata(items) {
+  const chain = Object.entries(GmgnFomoCore.TOKEN_NETWORK_IDS)
+    .find(([, id]) => id === Number(items[0]?.networkId))?.[0];
+  const addresses = [...new Set(items.map(item => item.tokenAddress))];
+  if (!chain || !addresses.length || addresses.length > FOMO_METADATA_BATCH_SIZE) return [];
+  const tabId = await activeGmgnTabId();
+  if (!Number.isInteger(tabId)) throw new Error("GMGN_METADATA_UNAVAILABLE");
+  const results = await chrome.scripting.executeScript({
+    target: { tabId }, world: "MAIN",
+    func: async (chainName, tokens) => {
+      const api = globalThis.__gmgnFollowTokenMetadata;
+      return typeof api === "function" ? api(chainName, tokens) : null;
+    },
+    args: [chain, addresses],
+  });
+  const rows = results?.[0]?.result;
+  if (!Array.isArray(rows)) throw new Error("GMGN_METADATA_UNAVAILABLE");
+  return (Array.isArray(rows) ? rows : []).filter(row => row?.chain === chain
+    && addresses.some(address => fomoTradeMetadataKey({ tokenAddress: address, networkId: items[0].networkId })
+      === fomoTradeMetadataKey({ tokenAddress: String(row.address || ""), networkId: items[0].networkId })))
+    .map(row => ({ key: fomoTradeMetadataKey({ tokenAddress: row.address, networkId: items[0].networkId }),
+      tokenAddress: row.address, networkId: Number(items[0].networkId),
+      tokenSymbol: typeof row.symbol === "string" ? row.symbol.slice(0, 120) : "",
+      tokenName: typeof row.name === "string" ? row.name.slice(0, 120) : "",
+      tokenImageUrl: GmgnFomoCore.safeTokenImageUrl(row.logo),
+      totalSupply: GmgnFomoCore.finiteNumber(row.total_supply),
+    }));
+}
+
 function gmgnFailureAllowsChainFallback(error, responseWasFulfilled) {
   if (!responseWasFulfilled) return true;
   return new Set([
@@ -2105,7 +2246,7 @@ function scheduleFomoMetadataBatch() {
   fomoMetadataBatchTimer = setTimeout(() => {
     fomoMetadataBatchTimer = null;
     flushFomoMetadataBatch();
-  }, FOMO_METADATA_BATCH_MS);
+  }, Math.max(FOMO_METADATA_BATCH_MS, GMGN_METADATA_INTERVAL_MS - (Date.now() - gmgnMetadataLastBatchAt)));
 }
 
 function flushFomoMetadataBatch() {
@@ -2114,31 +2255,29 @@ function flushFomoMetadataBatch() {
   const entries = [];
   for (const [key, entry] of fomoMetadataQueue) {
     if (entry.session.authorization !== first.session.authorization
-      || entry.session.supportedChains !== first.session.supportedChains) continue;
+      || entry.session.supportedChains !== first.session.supportedChains
+      || entry.item.networkId !== first.item.networkId) continue;
     fomoMetadataQueue.delete(key);
     entries.push(entry);
     if (entries.length === FOMO_METADATA_BATCH_SIZE) break;
   }
   fomoMetadataBatchesRunning += 1;
-  const request = GmgnFomoApi.buildFollowedTradesMetadataRequest(entries.map((entry) => entry.item));
-  fetchJson({ ...request, timeoutMs: FOMO_FOLLOWED_TIMEOUT_MS }, first.session).then((payload) => {
-    const metadata = new Map(GmgnFomoApi.sanitizeFollowedTradesMetadata(payload).map((item) => [item.key, item]));
+  gmgnMetadataLastBatchAt = Date.now();
+  fetchGmgnTradeMetadata(entries.map(entry => entry.item)).then(rows => {
+    const metadata = new Map(rows.map(item => [item.key, item]));
     for (const entry of entries) {
       const item = metadata.get(entry.tokenKey) || null;
       if (item) setBoundedCache(fomoFollowedMetadataCache, item.key,
         { cachedAt: Date.now(), item }, FOMO_FOLLOWED_METADATA_CACHE_MS, 512);
       else setBoundedCache(fomoMetadataMisses, entry.key,
-        { cachedAt: Date.now() }, FOMO_METADATA_NEGATIVE_CACHE_MS, 512);
+        { cachedAt: Date.now() }, GMGN_METADATA_NEGATIVE_CACHE_MS, 512);
       entry.resolve(item);
     }
-  }).catch((error) => {
+  }).catch(() => {
     for (const entry of entries) {
-      if (isFomoAuthError(error)) entry.reject(error);
-      else {
-        setBoundedCache(fomoMetadataMisses, entry.key,
-          { cachedAt: Date.now() }, FOMO_METADATA_NEGATIVE_CACHE_MS, 512);
-        entry.resolve(null);
-      }
+      setBoundedCache(fomoMetadataMisses, entry.key,
+        { cachedAt: Date.now(), retryAt: Date.now() + GMGN_METADATA_RETRY_MS }, GMGN_METADATA_NEGATIVE_CACHE_MS, 512);
+      entry.resolve(null);
     }
   }).finally(() => {
     for (const entry of entries) fomoFollowedMetadataRequests.delete(entry.key);
@@ -2154,7 +2293,7 @@ function queryFomoTradeMetadata(item, session) {
   const pending = fomoFollowedMetadataRequests.get(key);
   if (pending) return pending;
   const missed = fomoMetadataMisses.get(key);
-  if (missed && Date.now() - missed.cachedAt < FOMO_METADATA_NEGATIVE_CACHE_MS) return Promise.resolve(null);
+  if (missed && Date.now() < (missed.retryAt || missed.cachedAt + GMGN_METADATA_NEGATIVE_CACHE_MS)) return Promise.resolve(null);
   // Enrichment is optional; never hold up or drop the real-time trade itself.
   if (fomoMetadataQueue.size >= 512) return Promise.resolve(null);
   const promise = new Promise((resolve, reject) => {
@@ -2268,11 +2407,20 @@ async function loadFomoFollowedTrades(allowSessionRefresh = true, force = false)
     throw new Error("FOMO_NOT_CONNECTED");
   }
   try {
-    const items = await enrichFomoFollowedTrades(
-      await fetchFomoFollowedTradePages(session, force),
-      session,
-    );
-    fomoAlertRestSnapshot = { cachedAt: Date.now(), items };
+    const items = withCachedFomoFollowedTradesMetadata(await fetchFomoFollowedTradePages(session, force));
+    const snapshot = { cachedAt: Date.now(), items };
+    fomoAlertRestSnapshot = snapshot;
+    const generation = followedTradesEnabledGeneration;
+    // REST catch-up must deliver before optional, rate-limited metadata too.
+    enrichFomoFollowedTrades(items, session).then(async enriched => {
+      if (!followedTradesEnabled || generation !== followedTradesEnabledGeneration
+        || fomoAlertRestSnapshot !== snapshot
+        || (await getSession())?.authorization !== session.authorization) return;
+      snapshot.items = enriched;
+      if (fomoMarketFingerprint(enriched) !== fomoMarketFingerprint(items)) {
+        await publishFomoRealtimeItems(enriched, "rest-metadata", false, []);
+      }
+    }).catch(() => {});
     recordFollowedTradePipeline("fomo-rest-response", items, {
       count: items.length,
       durationMs: Date.now() - startedAt,
@@ -2739,6 +2887,10 @@ function holderFollowStateResponse(snapshot) {
   };
 }
 
+function invalidateDetailFollowStates() {
+  for (const visit of detailVisitsByTab.values()) visit.parts.delete("follow");
+}
+
 async function queryHolderFollowStates(force = false) {
   if (!force && holderFollowSnapshot
     && Date.now() - holderFollowSnapshot.cachedAt < HOLDER_FOLLOW_CACHE_MS) {
@@ -2810,6 +2962,7 @@ async function mutateFomoHolderFollow(userId, shouldFollow, allowSessionRefresh 
   let removed = 0;
   if (shouldFollow) allowFollowedTradeIdentity(identity);
   else removed = await purgeFollowedTradesForIdentity(identity);
+  invalidateDetailFollowStates();
   holderFollowSnapshot = {
     ...(holderFollowSnapshot || {}),
     cachedAt: Date.now(),
@@ -2892,6 +3045,7 @@ async function mutatePumpHolderFollow(userId, walletAddress, shouldFollow) {
     ...pumpProfileTradesSnapshot,
     items: filterUnfollowedTrades(pumpProfileTradesSnapshot.items),
   };
+  invalidateDetailFollowStates();
   holderFollowSnapshot = {
     ...(holderFollowSnapshot || {}),
     cachedAt: Date.now(),
@@ -4127,7 +4281,7 @@ async function publishFomoRealtimeItems(
   });
   const realtimeItems = acceptedItems.filter(isVerifiedFomoFollowedTrade);
   if (notify) broadcastGmgnFollowTradeEvents(realtimeItems, transport);
-  else if (transport === "websocket-metadata") broadcastGmgnFollowTradeMetadata(realtimeItems);
+  else if (["websocket-metadata", "rest-metadata"].includes(transport)) broadcastGmgnFollowTradeMetadata(realtimeItems);
   publishFollowedTradesResponse(withFollowedTradeRealtime(
     response,
     realtimeItems,
@@ -5316,9 +5470,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   let request;
   if (message?.type === "queryFomoToken") {
-    request = queryFomoTokenShared(message.params, {
-      includeFeed: message.includeFeed !== false, force: message.force === true,
-    });
+    const options = { includeFeed: message.includeFeed !== false, force: message.force === true,
+      oncePerVisit: message.oncePerVisit === true, tabId: message.tabId };
+    request = queryDetailPart(message.params, _sender, options, "token", () => queryFomoTokenShared(message.params, options));
+  } else if (message?.type === "queryFomoFeed") {
+    const options = { force: message.force === true, oncePerVisit: message.oncePerVisit === true, tabId: message.tabId };
+    request = queryDetailPart(message.params, _sender, options, "feed", () => queryFomoFeed(message.params, options.force));
   } else if (message?.type === "resolveFomoHolderAddress") {
     request = resolveFomoHolderAddressShared(message.params, message.holder, _sender.tab?.id);
   } else if (message?.type === "resolvePumpHolderAddress") {
@@ -5330,12 +5487,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
     request = copyHolderAddress(message.address, message.networkId);
   } else if (message?.type === "queryPumpHolders") {
-    request = queryPumpHoldersShared(message.params).then((payload) => ({
-      ok: true,
-      items: GmgnPumpApi.sanitizePositions(payload, message.metadata),
-    }));
+    const options = { force: message.force === true, oncePerVisit: message.oncePerVisit === true, tabId: message.tabId };
+    request = queryDetailPart(message.params, _sender, options, "pump", () => queryPumpHoldersShared(message.params).then(payload => ({
+      ok: true, items: GmgnPumpApi.sanitizePositions(payload, message.metadata),
+    })));
   } else if (message?.type === "queryHolderFollowStates") {
-    request = queryHolderFollowStates(message.force === true);
+    const options = { force: message.force === true, oncePerVisit: message.oncePerVisit === true, tabId: message.tabId };
+    request = queryDetailPart(message.params, _sender, options, "follow", () => queryHolderFollowStates(options.force));
   } else if (message?.type === "toggleHolderFollow") {
     if (_sender.id !== chrome.runtime.id) {
       sendResponse({ ok: false, error: "INVALID_MESSAGE_SENDER" });
@@ -5357,7 +5515,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     .then(sendResponse)
     .catch((error) => {
       const code = error?.message || "FOMO_REQUEST_FAILED";
-      const isFomoRequest = ["queryFomoToken", "resolveFomoHolderAddress"]
+      const isFomoRequest = ["queryFomoToken", "queryFomoFeed", "resolveFomoHolderAddress"]
         .includes(message?.type);
       sendResponse({
         ok: false,

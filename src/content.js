@@ -8,7 +8,6 @@
   const HOST_ID = "gmgn-fomo-panel-host";
   const INSTANCE_ATTRIBUTE = "data-gmgn-fomo-panel-instance";
   const LAYOUT_KEY = "gmgnFomoPanelLayoutV1";
-  const REFRESH_MS = 5_000;
   const INITIAL_LOAD_SETTLE_MS = 500;
   const INITIAL_LOAD_IDLE_TIMEOUT_MS = 1_000;
   const TOKEN_LOAD_TIMEOUT_MS = 13_000;
@@ -21,11 +20,13 @@
   let currentPumpItems = [];
   let requestVersion = 0;
   let activeLoad = null;
+  let loadedVersion = -1;
+  let holderExtrasLoad = null;
+  let feedLoad = null;
   let extensionContextValid = true;
   let sidePanelVisible = false;
   let sidePanelStateReady = false;
   let pendingInitialLoad = null;
-  let refreshTimer = null;
   let currentLayout = null;
   const holderCopyStates = new Map();
   const holderFollowActions = new Map();
@@ -127,7 +128,7 @@
       return holderFollowRequest.then(() => refreshHolderFollowStates(true));
     }
     holderFollowRequestForce = force;
-    holderFollowRequest = sendMessage({ type: "queryHolderFollowStates", force })
+    holderFollowRequest = sendMessage({ type: "queryHolderFollowStates", force, params: currentView?.route, oncePerVisit: true })
       .then((result) => {
         if (result?.ok && applyHolderFollowState(result)) rerenderHolderActions();
         return result;
@@ -446,7 +447,6 @@
       <nav class="fomo-tabs" aria-label="Fomo token tabs">
         <button type="button" class="active" data-tab="holders">Holders</button>
         <button type="button" data-tab="feed">Feed</button>
-        <button type="button" data-tab="about">About</button>
       </nav>
       <main class="fomo-body">
         <div class="fomo-content" data-role="content"><div class="fomo-loading"><i></i><i></i><i></i></div></div>
@@ -463,6 +463,7 @@
             <input type="checkbox" data-role="tracking-toggle" aria-label="关注交易推送到追踪" checked>
             <span>推送追踪</span><i aria-hidden="true"></i>
           </label>
+          <button type="button" data-role="refresh">刷新</button>
           <a data-role="open-fomo" target="_blank" rel="noopener noreferrer">Open Fomo ↗</a>
         </span>
       </footer>`;
@@ -496,6 +497,7 @@
       event.stopPropagation();
       sendMessage({ type: "openFomoSidePanel" }).catch(() => {});
     });
+    shadow.querySelector("[data-role='refresh']").addEventListener("click", () => load(view, false, true));
 
     shadow.querySelector(".fomo-collapse").addEventListener("click", (event) => {
       event.stopPropagation();
@@ -528,7 +530,7 @@
         renderActiveTab(view);
         const tab = view.activeTab;
         const version = requestVersion;
-        if (tab !== "about") Promise.resolve(activeLoad?.promise).catch(() => {}).then(() => {
+        Promise.resolve(activeLoad?.promise).catch(() => {}).then(() => {
           if (version === requestVersion && view.activeTab === tab && canLoadView(view)) load(view, true);
         });
       });
@@ -914,65 +916,10 @@
     view.content.replaceChildren(fragment);
   }
 
-  function aboutStat(label, value) {
-    const item = element("div", "fomo-about-stat");
-    item.append(element("span", "", label), element("strong", "", value));
-    return item;
-  }
-
-  function renderAbout(view) {
-    const { metadata, holders } = currentData;
-    const wrapper = element("div", "fomo-about");
-    wrapper.append(element("h2", "", `About ${metadata.symbol || metadata.name}`));
-    wrapper.append(element("p", "fomo-about-description", metadata.description || "No description provided by fomo.family."));
-
-    const stats = element("div", "fomo-about-grid");
-    stats.append(
-      aboutStat("Market cap", core.compactUsd(metadata.marketCap)),
-      aboutStat("Price", core.compactUsd(metadata.priceUsd, 4)),
-      aboutStat("24H volume", core.compactUsd(metadata.volume24)),
-      aboutStat("Liquidity", core.compactUsd(metadata.liquidity)),
-      aboutStat("Holders", core.compactNumber(holders.totalHolders)),
-      aboutStat(
-        holders.isFomoPositionValueComplete ? "Fomo positions" : "Fomo top positions",
-        core.compactUsd(holders.fomoPositionValue),
-      ),
-      ...(core.finiteNumber(holders.fomoOwnershipPercent) === null ? [] : [aboutStat(
-        holders.isFomoOwnershipComplete ? "Fomo ownership" : "Fomo Top 100 ownership",
-        core.holdingPercent(holders.fomoOwnershipPercent),
-      )]),
-      aboutStat("Supply", core.compactNumber(metadata.totalSupply)),
-    );
-    wrapper.append(stats);
-
-    const details = element("div", "fomo-about-details");
-    details.append(aboutStat("Network", view.route.fomoChain));
-    if (metadata.launchpad.name) details.append(aboutStat("Launchpad", metadata.launchpad.name));
-    details.append(aboutStat("Contract address", `${metadata.address.slice(0, 8)}…${metadata.address.slice(-6)}`));
-    wrapper.append(details);
-
-    const links = element("div", "fomo-socials");
-    for (const [name, url] of Object.entries(metadata.socialLinks)) {
-      const link = element("a", "", name === "twitter" ? "X / Twitter" : `${name[0].toUpperCase()}${name.slice(1)}`);
-      link.href = url;
-      link.target = "_blank";
-      link.rel = "noopener noreferrer";
-      links.append(link);
-    }
-    const fomoLink = element("a", "primary", "View on Fomo ↗");
-    fomoLink.href = fomoTokenUrl(view.route);
-    fomoLink.target = "_blank";
-    fomoLink.rel = "noopener noreferrer";
-    links.append(fomoLink);
-    wrapper.append(links);
-    view.content.replaceChildren(wrapper);
-  }
-
   function renderActiveTab(view) {
     if (!currentData || !canLoadView(view)
       || view.panel.classList.contains("collapsed")) return;
     if (view.activeTab === "feed") renderFeed(view);
-    else if (view.activeTab === "about") renderAbout(view);
     else renderHolders(view);
   }
 
@@ -1036,81 +983,93 @@
       && !view.host.hidden && !sidePanelVisible && document.visibilityState === "visible";
   }
 
-  function stopRefresh() {
-    if (refreshTimer !== null) clearTimeout(refreshTimer);
-    refreshTimer = null;
-  }
-
-  function scheduleRefresh() {
-    stopRefresh();
-    if (!canLoadView(currentView) || pendingInitialLoad || activeLoad) return;
-    refreshTimer = setTimeout(() => {
-      refreshTimer = null;
-      load(currentView, true);
-    }, REFRESH_MS);
-  }
-
   function load(view, silent = false, force = false) {
     if (!canLoadView(view)) return Promise.resolve();
-    if (activeLoad?.view === view && activeLoad.version === requestVersion) {
-      return activeLoad.promise;
+    if (activeLoad?.view === view && activeLoad.version === requestVersion) return activeLoad.promise;
+    if (!force && loadedVersion === requestVersion) {
+      if (view.loadError) { renderError(view, view.loadError); return Promise.resolve(); }
+      if (currentData) {
+        renderCollapsedPosition(view, currentData.holders);
+        if (!view.panel.classList.contains("collapsed")) {
+          renderHeader(view, currentData.metadata);
+          renderActiveTab(view);
+        }
+        view.status.textContent = view.loadedStatus;
+      }
+      return loadPanelSection(view);
     }
-    stopRefresh();
     const version = requestVersion;
     const entry = { view, version, promise: null };
+    view.loadError = null;
     if (!view.panel.classList.contains("collapsed")) refreshPumpNotice(view);
     if (!silent) view.status.textContent = "Loading fomo.family…";
     entry.promise = (async () => {
       try {
-        const result = await sendMessage({
-          type: "queryFomoToken",
-          params: { address: view.route.address, networkId: view.route.networkId },
-          includeFeed: view.activeTab === "feed" && !view.panel.classList.contains("collapsed"),
-          force,
-        });
-        if (version !== requestVersion || !canLoadView(view)) return;
-        if (!result?.ok) return renderError(view, result?.error);
-        const fomoData = result.data;
-        const updatedAt = result.cached ? result.cachedAt : Date.now();
+        const result = await sendMessage({ type: "queryFomoToken", params: {
+          address: view.route.address, networkId: view.route.networkId,
+        }, oncePerVisit: true, includeFeed: false, force });
+        if (version !== requestVersion || view !== currentView) return;
+        loadedVersion = version;
+        if (!result?.ok) {
+          view.loadError = result?.error || "FOMO_REQUEST_FAILED";
+          if (canLoadView(view)) renderError(view, view.loadError);
+          return;
+        }
+        if (force) { holderExtrasLoad = null; feedLoad = null; }
+        currentData = withPumpItems(result.data, currentPumpItems);
+        const updatedAt = result.cached ? result.cachedAt : result.updatedAt || Date.now();
         const label = result.cached ? "Cached" : result.partial ? "Partially updated" : "Updated";
-        const updatedLabel = `${label} ${new Date(updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
-        currentData = withPumpItems(fomoData, currentPumpItems);
+        view.loadedStatus = `${label} ${new Date(updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+        if (!canLoadView(view)) return;
         renderCollapsedPosition(view, currentData.holders);
-        view.status.textContent = updatedLabel;
-        // A collapsed panel needs only the Fomo aggregate, not hidden holder
-        // cards, follow-state lookups or Pump holder requests.
+        view.status.textContent = view.loadedStatus;
         if (view.panel.classList.contains("collapsed")) return;
         renderHeader(view, currentData.metadata);
         renderActiveTab(view);
-        if (view.activeTab !== "holders") return;
-        if (typeof refreshHolderFollowStates === "function") {
-          refreshHolderFollowStates(force);
-        }
-
-        const pumpResult = await sendMessage({
-          type: "queryPumpHolders",
-          params: { address: view.route.address, networkId: view.route.networkId },
-          metadata: fomoData.metadata,
-        }).catch(() => null);
-        if (version !== requestVersion || !canLoadView(view)) return;
-        const hadPumpItems = currentPumpItems.length > 0;
-        if (pumpResult?.ok) {
-          currentPumpItems = Array.isArray(pumpResult.items) ? pumpResult.items : [];
-        }
-        currentData = withPumpItems(fomoData, currentPumpItems);
-        const animatePump = !hadPumpItems && currentPumpItems.length > 0;
-        if (pumpResult?.ok && view.activeTab === "holders" && !view.panel.classList.contains("collapsed")) {
-          renderHolders(view, animatePump);
-        }
+        loadPanelSection(view, force);
       } catch (error) {
-        if (version !== requestVersion || !canLoadView(view)) return;
-        renderError(view, error?.message);
+        if (version === requestVersion && view === currentView) {
+          loadedVersion = version;
+          view.loadError = error?.message || "FOMO_REQUEST_FAILED";
+          if (canLoadView(view)) renderError(view, view.loadError);
+        }
       }
-    })().finally(() => {
-      if (activeLoad === entry) activeLoad = null;
-      scheduleRefresh();
-    });
+    })().finally(() => { if (activeLoad === entry) activeLoad = null; });
     activeLoad = entry;
+    return entry.promise;
+  }
+
+  function loadPanelSection(view, force = false) {
+    if (!currentData || !canLoadView(view) || view.panel.classList.contains("collapsed")) return Promise.resolve();
+    const version = requestVersion, data = currentData;
+    if (view.activeTab === "feed") {
+      if (!force && feedLoad?.version === version) return feedLoad.promise;
+      const entry = { version, promise: null };
+      entry.promise = sendMessage({ type: "queryFomoFeed", params: {
+        address: view.route.address, networkId: view.route.networkId,
+      }, oncePerVisit: true, force }).then(result => {
+        if (version !== requestVersion || !currentData || feedLoad !== entry) return;
+        if (!result?.ok) { if (canLoadView(view)) view.status.textContent = result?.error || "FOMO_FEED_FAILED"; return; }
+        currentData = { ...currentData, feed: result.items };
+        if (canLoadView(view) && view.activeTab === "feed") renderFeed(view);
+      }).catch(error => { if (version === requestVersion && canLoadView(view)) view.status.textContent = error?.message || "FOMO_FEED_FAILED"; });
+      feedLoad = entry;
+      return entry.promise;
+    }
+    if (!force && holderExtrasLoad?.version === version) return holderExtrasLoad.promise;
+    const entry = { version, promise: null };
+    entry.promise = (async () => {
+      refreshHolderFollowStates(force);
+      const result = await sendMessage({ type: "queryPumpHolders", params: {
+        address: view.route.address, networkId: view.route.networkId,
+      }, metadata: data.metadata, oncePerVisit: true, force }).catch(() => null);
+      if (version !== requestVersion || !currentData || holderExtrasLoad !== entry) return;
+      const hadItems = currentPumpItems.length > 0;
+      if (result?.ok) currentPumpItems = Array.isArray(result.items) ? result.items : [];
+      currentData = withPumpItems(currentData, currentPumpItems);
+      if (result?.ok && canLoadView(view) && view.activeTab === "holders") renderHolders(view, !hadItems && currentPumpItems.length > 0);
+    })();
+    holderExtrasLoad = entry;
     return entry.promise;
   }
 
@@ -1192,7 +1151,6 @@
     const key = route ? `${route.chain}:${route.address}` : "";
     if (key !== currentKey) {
       cancelInitialLoad();
-      stopRefresh();
       if (currentView) {
         saveLayout(currentView);
         currentView.stopLayoutTracking?.();
@@ -1202,6 +1160,7 @@
       currentRoute = route;
       currentData = null;
       currentPumpItems = [];
+      holderExtrasLoad = null; feedLoad = null;
       requestVersion += 1;
       currentView = null;
       sendMessage({ type: "gmgnTokenRouteChanged", route }).catch(() => {});
@@ -1210,7 +1169,6 @@
     if (sidePanelVisible) {
       if (!currentView || currentView.host.hidden) return;
       cancelInitialLoad();
-      stopRefresh();
       saveLayout(currentView);
       currentView.stopLayoutTracking?.();
       requestVersion += 1;
@@ -1218,6 +1176,7 @@
       currentView.content?.replaceChildren();
       currentData = null;
       currentPumpItems = [];
+      holderExtrasLoad = null; feedLoad = null;
       hideOverlayHost();
       return;
     }
@@ -1238,6 +1197,15 @@
     if (!isActiveInstance()) return false;
     if (message?.type === "gmgnFomoPing") {
       sendResponse({ ok: true, version: chrome.runtime.getManifest().version });
+      return false;
+    }
+    if (message?.type === "fomoSessionChanged") {
+      const version = requestVersion, view = currentView;
+      Promise.resolve(activeLoad?.promise).catch(() => {}).finally(() => {
+        if (version !== requestVersion || view !== currentView) return;
+        if (!currentData) { loadedVersion = -1; if (canLoadView(view)) load(view, true); }
+        else if (canLoadView(view)) refreshHolderFollowStates(true);
+      });
       return false;
     }
     if (message?.type !== "sidePanelVisibilityChanged") return false;
@@ -1263,7 +1231,6 @@
   document.addEventListener("visibilitychange", (event) => {
     if (!event.isTrusted) return;
     if (document.visibilityState !== "visible") {
-      stopRefresh();
       pauseInitialLoad();
       currentView?.stopLayoutTracking?.();
     } else {

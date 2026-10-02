@@ -23,7 +23,6 @@
     <nav class="fomo-tabs" aria-label="Fomo token tabs">
       <button type="button" class="active" data-tab="holders">Holders</button>
       <button type="button" data-tab="feed">Feed</button>
-      <button type="button" data-tab="about">About</button>
     </nav>
     <main class="fomo-body"><div class="fomo-content" data-role="content"></div></main>
     <section class="fomo-pump-notice" data-role="pump-notice" aria-live="polite" hidden>
@@ -107,6 +106,8 @@
             const data = structuredClone(fixtureData);
             data.metadata.marketCap += queryCount * 1000;
             callback({ ok: true, data });
+          } else if (message.type === "queryFomoFeed") {
+            callback({ ok: true, items: structuredClone(fixtureData.feed) });
           } else if (message.type === "queryPumpHolders") {
             setTimeout(() => callback({ ok: true, items: structuredClone(pumpItems) }), 240);
           } else if (message.type === "getFollowedTradeSources") {

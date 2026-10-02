@@ -1,7 +1,7 @@
 (function installGmgnFollowThinBridge() {
   "use strict";
 
-  const BRIDGE_VERSION = "1.0.5";
+  const BRIDGE_VERSION = "1.0.6";
   const MESSAGE_CHANNEL = "gmgn-follow-trade-event-v1";
   const RETRY_OFFSETS_MS = Object.freeze([0, 100, 250, 500, 1_000, 2_000, 4_000]);
   const EVENT_TTL_MS = 5_000;
@@ -406,6 +406,39 @@
     gmgnTokenBriefApi = accepts(module);
     return gmgnTokenBriefApi;
   }
+
+  globalThis.__gmgnFollowTokenMetadata = (chain, addresses) => new Promise(resolve => {
+    if (!Object.values(bridge.NETWORK_CHAINS).includes(chain) || !Array.isArray(addresses)
+      || !addresses.length || addresses.length > 50
+      || addresses.some(address => typeof address !== "string"
+        || !(chain === "sol" ? /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address) : /^0x[0-9a-fA-F]{40}$/.test(address)))) return resolve([]);
+    let subscription = null, finished = false;
+    const finish = rows => {
+      if (finished) return;
+      finished = true; clearTimeout(timer);
+      try { subscription?.unsubscribe(); } catch {}
+      resolve(rows);
+    };
+    const timer = setTimeout(() => finish(null), 6_000);
+    try {
+      const response = discoverGmgnTokenBriefApi()?.(chain, addresses);
+      if (typeof response?.subscribe !== "function") return finish(null);
+      subscription = response.subscribe({
+        next(payload) {
+          const rows = (Array.isArray(payload?.tokens) ? payload.tokens : []).filter(token => token?.chain === chain
+            && typeof token.address === "string" && addresses.some(address => supplyKey(chain, address) === supplyKey(chain, token.address)));
+          finish(rows.map(token => ({ chain, address: token.address,
+            symbol: typeof token.symbol === "string" ? token.symbol.slice(0, 120) : "",
+            name: typeof token.name === "string" ? token.name.slice(0, 120) : "",
+            logo: typeof token.logo === "string" ? token.logo.slice(0, 2_048) : "",
+            total_supply: bridge.finiteNumber(token.total_supply),
+          })));
+        },
+        error: () => finish(null), complete: () => finish([]),
+      });
+      if (finished) subscription?.unsubscribe();
+    } catch { finish(null); }
+  });
 
   function supplyKey(chain, address) {
     return `${chain}:${chain === "sol" ? address : address.toLowerCase()}`;

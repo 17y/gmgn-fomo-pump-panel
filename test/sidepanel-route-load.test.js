@@ -12,18 +12,19 @@ function harness({ defer = false } = {}) {
   const timers = new Map(), requests = [], rendered = [], replies = [];
   const context = vm.createContext({
     Date, Promise, currentRoute: null, currentData: null, currentPumpItems: [], activeTab: "holders",
-    requestVersion: 0, activeLoad: null, routeLoadTimer: null, ROUTE_SETTLE_MS: 300,
+    requestVersion: 0, currentTabId: 1, loadedVersion: -1, holderExtrasLoad: null, feedLoad: null, activeLoad: null, routeLoadTimer: null, ROUTE_SETTLE_MS: 300,
     document: { visibilityState: "visible" }, status: {}, openFomo: {},
     setTimeout(fn, delay) { const id = ++nextId; timers.set(id, { fn, at: now + delay }); return id; },
     clearTimeout(id) { timers.delete(id); },
     fomoTokenUrl: (value) => value.address,
     renderPendingHeader() {}, renderIdle() {}, showLoading() {}, renderError() {},
-    renderHeader(metadata) { rendered.push(metadata.token); }, renderActiveTab() {}, renderHolders() {},
+    renderHeader(metadata) { rendered.push(metadata.token); }, renderActiveTab() {}, renderHolders() {}, renderFeed() {},
     refreshHolderFollowStates() {},
     withPumpItems: (data) => data,
     sendMessage(message) {
       requests.push(message);
       if (message.type === "queryPumpHolders") return Promise.resolve({ ok: true, items: [] });
+      if (message.type === "queryFomoFeed") return Promise.resolve({ ok: true, items: [] });
       const result = { ok: true, data: { metadata: { token: message.params.address }, holders: { items: [] }, feed: [] } };
       if (!defer) return Promise.resolve(result);
       return new Promise((resolve) => { replies.push(() => resolve(result)); });
@@ -111,4 +112,26 @@ test("ten thousand route replacements retain one timer and load only the final r
   assert.equal(h.timers.size, 0);
   assert.equal(h.requests.filter(message => message.type === "queryFomoToken").length, 1);
   assert.deepEqual(h.rendered, ["token-9999"]);
+});
+
+test("idle, focus and section switches never re-read token data; Feed is loaded once on demand", async () => {
+  const h = harness();
+  h.context.api.setRoute(route(1)); await h.advance(300);
+  for (let i = 0; i < 100; i++) {
+    await h.advance(60_000); await h.context.api.load(true);
+    h.context.api.setRoute(route(1));
+  }
+  assert.equal(h.requests.filter(m => m.type === "queryFomoToken").length, 1);
+  assert.equal(h.requests.filter(m => m.type === "queryPumpHolders").length, 1);
+  assert.equal(h.requests.filter(m => m.type === "queryFomoFeed").length, 0);
+  h.context.activeTab = "feed"; await h.context.api.load(true);
+  h.context.activeTab = "holders"; await h.context.api.load(true);
+  h.context.activeTab = "feed"; await h.context.api.load(true);
+  assert.equal(h.requests.filter(m => m.type === "queryFomoFeed").length, 1);
+  assert.equal(h.requests.filter(m => m.type === "queryFomoToken").length, 1);
+  await h.context.api.load(false, true);
+  await flush();
+  assert.equal(h.requests.filter(m => m.type === "queryFomoToken").length, 2);
+  assert.equal(h.requests.filter(m => m.type === "queryFomoFeed").length, 2);
+  assert.equal(h.timers.size, 0);
 });

@@ -233,20 +233,22 @@ test('blocked optional diagnostic storage retains only the newest 300 pending ev
   assert.equal(c.followedTradesPipelinePendingEvents.length, 0);
 });
 
-test('Fomo metadata burst bounds queued keys, batches, timers, and releases them after completion', async () => {
+test('GMGN metadata burst bounds queued keys, batches, timers, and releases them after completion', async () => {
   const timers = new Map(), gates = [], queue = new Map(), pending = new Map();
-  let calls = 0;
+  const starts = [];
+  let calls = 0, now = 0;
   const c = vm.createContext({
-    Date, followedTradesEnabled: true, fomoMetadataQueue: queue, fomoFollowedMetadataRequests: pending,
+    Date: { now: () => now }, gmgnMetadataLastBatchAt: -Infinity, followedTradesEnabled: true, fomoMetadataQueue: queue, fomoFollowedMetadataRequests: pending,
     fomoMetadataBatchTimer: null, fomoMetadataBatchesRunning: 0,
     fomoMetadataMisses: new Map(), fomoFollowedMetadataCache: new Map(),
     GmgnFomoCore: require('../src/core'), GmgnFomoApi: require('../src/fomo-api'),
-    setTimeout(fn) { const id = {}; timers.set(id, fn); return id; },
+    setTimeout(fn, delay) { const id = {}; timers.set(id, { fn, delay }); return id; },
     clearTimeout(id) { timers.delete(id); },
-    fetchJson(request) {
+    fetchGmgnTradeMetadata(items) {
       calls++;
-      assert.ok(JSON.parse(request.body).length <= 50);
-      return new Promise(resolve => gates.push(() => resolve({ responseObject: [] })));
+      starts.push(now);
+      assert.ok(items.length <= 50);
+      return new Promise(resolve => gates.push(() => resolve([])));
     },
   });
   vm.runInContext(constants + cacheFunctions + block('function isFomoAuthError(', 'function withCachedFomoFollowedTradesMetadata('), c);
@@ -256,31 +258,33 @@ test('Fomo metadata burst bounds queued keys, batches, timers, and releases them
   const submit = (start, count) => {
     for (let i = start; i < start + count; i++) requests.push(c.queryFomoTradeMetadata(item(i), session));
   };
-  const runTimers = () => { for (const [id, fn] of [...timers]) { timers.delete(id); fn(); } };
+  const runTimers = () => { for (const [id, timer] of [...timers]) { timers.delete(id); now += timer.delay; timer.fn(); } };
   submit(1, 10000);
   assert.equal(queue.size, 512);
   assert.equal(pending.size, 512);
   assert.equal(timers.size, 1);
   assert.equal(queue.values().next().value.item.unusedLargeField, undefined);
   runTimers(); runTimers();
-  assert.equal(calls, 2);
-  assert.equal(c.fomoMetadataBatchesRunning, 2);
+  assert.equal(calls, 1);
+  assert.equal(c.fomoMetadataBatchesRunning, 1);
   submit(10001, 1000);
   assert.equal(queue.size, 512);
-  assert.equal(pending.size, 612, '512 waiting plus two active batches of 50');
-  assert.equal(timers.size, 0, 'no polling timer while both slots are busy');
+  assert.equal(pending.size, 562, '512 waiting plus one active batch of 50');
+  assert.equal(timers.size, 0, 'no polling timer while the single slot is busy');
   assert.equal(c.queryFomoTradeMetadata(item(1), session), requests[0]);
   while (pending.size) {
     gates.splice(0).forEach(resolve => resolve());
     await flush();
     runTimers();
-    assert.ok(c.fomoMetadataBatchesRunning <= 2);
+    assert.ok(c.fomoMetadataBatchesRunning <= 1);
   }
   await Promise.all(requests);
   assert.equal(queue.size, 0);
   assert.equal(c.fomoMetadataBatchesRunning, 0);
   assert.equal(c.fomoMetadataMisses.size, 512);
   assert.equal(timers.size, 0);
+  assert.ok(starts.length > 2);
+  assert.ok(starts.slice(1).every((at, i) => at - starts[i] >= 5000), 'batches start at least five seconds apart');
 });
 
 test('Feed grace timer is omitted for Holders and cleared when Feed returns early', async () => {

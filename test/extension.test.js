@@ -105,8 +105,9 @@ test("原生 Side Panel 由用户手势打开并同步 GMGN 路由", () => {
   assert.match(background, /sidePanelVisibilityChanged/);
   assert.match(content, /gmgnTokenRouteChanged/);
   assert.match(content, /getSidePanelVisibility/);
-  assert.match(content, /REFRESH_MS = 5_000/);
-  assert.match(sidePanel, /REFRESH_MS = 5_000/);
+  assert.doesNotMatch(content, /REFRESH_MS|scheduleRefresh/);
+  assert.doesNotMatch(sidePanel, /REFRESH_MS|setInterval\(\(\) => \{\s*if \(currentRoute/);
+  assert.doesNotMatch(html, /data-tab="about"/);
   assert.match(sidePanel, /SIDE_PANEL_HEARTBEAT_MS = 20_000/);
   assert.match(sidePanel, /void chrome\.runtime\.lastError/);
   assert.match(sidePanel, /if \(visibilityPort !== port\) return;/);
@@ -165,7 +166,7 @@ test("Holders 保持现有卡片结构并标注 Fomo 与 Pump 来源", () => {
   assert.match(sidePanel, /pumpApi\.mergeHolderItems/);
   for (const source of [content, sidePanel]) {
     const fomoRequest = source.indexOf('type: "queryFomoToken"');
-    const fomoRender = source.indexOf("currentData = withPumpItems(fomoData, currentPumpItems);", fomoRequest);
+    const fomoRender = source.indexOf("currentData = withPumpItems(result.data, currentPumpItems);", fomoRequest);
     const pumpRequest = source.indexOf('type: "queryPumpHolders"', fomoRequest);
     assert.ok(fomoRequest !== -1 && fomoRender > fomoRequest && pumpRequest > fomoRender);
     assert.doesNotMatch(source, /renderImmediately/);
@@ -284,7 +285,7 @@ test("非关键插件工作不进入 GMGN 首屏关键路径", () => {
   assert.match(background, /type: "fomoSessionChanged"/);
   assert.match(sidePanel, /reloadAfterFomoSessionChange/);
   assert.match(sidePanel, /message\?\.type === "fomoSessionChanged"/);
-  assert.match(content, /REFRESH_MS = 5_000/);
+  assert.doesNotMatch(content, /REFRESH_MS|scheduleRefresh/);
   assert.match(main, /RETRY_OFFSETS_MS = Object\.freeze\(\[0, 100, 250, 500, 1_000, 2_000, 4_000\]\)/);
   assert.doesNotMatch(main, /setInterval|scheduleWebpackScan|axiosBridgeInstalled/);
   assert.doesNotMatch(

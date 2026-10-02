@@ -57,26 +57,27 @@ function harness({ collapsed = false, deferred = false } = {}) {
     var HOST_ID = "panel";
     var REFRESH_MS = 5000;
     var currentKey = "", currentRoute = null, currentView = null, currentData = null;
-    var currentPumpItems = [], requestVersion = 0, activeLoad = null, refreshTimer = null;
+    var currentPumpItems = [], requestVersion = 0, activeLoad = null;
+    var loadedVersion = -1, holderExtrasLoad = null, feedLoad = null;
     var pendingInitialLoad = null, sidePanelVisible = false, sidePanelStateReady = true;
     ${loadBlock}
     ${routeBlock}
-    globalThis.api = { load, syncRoute, stopRefresh, scheduleRefresh };
+    globalThis.api = { load, syncRoute };
     syncRoute();
     pendingInitialLoad = null;
   `, context);
   return { context, state, requests, renders, timers, data, reply: () => reply({ ok: true, data }) };
 }
 
-test("collapsed refresh updates only the Fomo summary and arms one bounded next refresh", async () => {
+test("collapsed panel loads the Fomo summary once without a polling timer", async () => {
   const h = harness({ collapsed: true });
   await h.context.api.load(h.context.currentView);
   assert.deepEqual(h.requests, ["gmgnTokenRouteChanged", "queryFomoToken"]);
   assert.deepEqual(h.renders, ["summary"]);
-  assert.equal(h.timers.size, 1);
-  assert.equal([...h.timers.values()][0].delay, 5000);
+  assert.equal(h.timers.size, 0);
+  await h.context.api.load(h.context.currentView);
+  assert.equal(h.requests.length, 2);
   h.context.document.visibilityState = "hidden";
-  h.context.api.scheduleRefresh();
   await h.context.api.load(h.context.currentView);
   assert.equal(h.timers.size, 0);
   assert.equal(h.requests.length, 2);
@@ -142,6 +143,21 @@ test("leaving a token page disposes its view and timers without creating a senti
   assert.equal(h.state.creates, 1);
 });
 
+test("an initial response arriving while hidden renders on resume without another token read", async () => {
+  const h = harness({ deferred: true });
+  const view = h.context.currentView;
+  const request = h.context.api.load(view);
+  h.context.document.visibilityState = "hidden";
+  h.reply(); await request;
+  assert.equal(h.context.currentData, h.data);
+  assert.deepEqual(h.renders, ["notice"]);
+  h.context.document.visibilityState = "visible";
+  await h.context.api.load(view);
+  assert.equal(h.requests.filter(type => type === "queryFomoToken").length, 1);
+  assert.ok(h.renders.includes("body"));
+  assert.equal(h.timers.size, 0);
+});
+
 test("both panel surfaces keep Solana token route identity case-sensitive", () => {
   const first = "/sol/token/So11111111111111111111111111111111111111112";
   const second = "/sol/token/so11111111111111111111111111111111111111112";
@@ -155,7 +171,8 @@ test("both panel surfaces keep Solana token route identity case-sensitive", () =
   const sidePanel = fs.readFileSync("src/sidepanel.js", "utf8");
   const block = sidePanel.slice(sidePanel.indexOf("  function setRoute("), sidePanel.indexOf("  function routeFromUrl("));
   const context = vm.createContext({
-    currentRoute: core.parseTokenRoute(first), currentData: null, currentPumpItems: [], requestVersion: 0,
+    currentRoute: core.parseTokenRoute(first), currentTabId: 1, currentData: null, currentPumpItems: [], requestVersion: 0,
+    holderExtrasLoad: null, feedLoad: null,
     openFomo: {}, fomoTokenUrl: () => "", renderPendingHeader() {}, load() {}, renderIdle() {},
     routeLoadTimer: null, ROUTE_SETTLE_MS: 300, setTimeout: () => 1, clearTimeout() {},
   });

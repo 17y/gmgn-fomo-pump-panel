@@ -18,10 +18,10 @@ function createLoadHarness(source, kind) {
   const loadSource = functionBlock(
     source,
     kind === "content" ? "  function canLoadView(" : "  function load(",
-    kind === "content" ? "\n  function syncRoute" : "\n  function setRoute",
+    kind === "content" ? "\n  function clearInitialLoadHandles" : "\n  function setRoute",
   );
   let resolvePump;
-  const state = { fomoCalls: 0, pumpCalls: 0, renderedItems: [], messages: [], followForces: [] };
+  const state = { fomoCalls: 0, feedCalls: 0, pumpCalls: 0, renderedItems: [], messages: [], followForces: [] };
   const fomoData = { metadata: {}, holders: { items: [] } };
   const context = {
     Date,
@@ -36,6 +36,7 @@ function createLoadHarness(source, kind) {
     renderHeader() {},
     renderCollapsedPosition() {},
     renderActiveTab() {},
+    renderFeed() {},
     renderError() {},
     renderIdle() {},
     withPumpItems(data, items) {
@@ -50,6 +51,10 @@ function createLoadHarness(source, kind) {
         state.fomoCalls += 1;
         return Promise.resolve({ ok: true, data: fomoData });
       }
+      if (message.type === "queryFomoFeed") {
+        state.feedCalls++;
+        return Promise.resolve({ ok: true, items: [] });
+      }
       state.pumpCalls += 1;
       return new Promise((resolve) => { resolvePump = resolve; });
     },
@@ -58,6 +63,7 @@ function createLoadHarness(source, kind) {
     ? `
       var requestVersion = 1;
       var activeLoad = null;
+      var loadedVersion = -1, holderExtrasLoad = null, feedLoad = null;
       var currentPumpItems = [];
       var currentData = null;
       var sidePanelVisible = false;
@@ -75,6 +81,7 @@ function createLoadHarness(source, kind) {
     : `
       var requestVersion = 1;
       var activeLoad = null;
+      var loadedVersion = -1, holderExtrasLoad = null, feedLoad = null, currentTabId = 1;
       var currentPumpItems = [];
       var currentData = null;
       var currentRoute = { address: "token", networkId: 56 };
@@ -117,34 +124,32 @@ for (const [name, source] of [["content", content], ["side panel", sidePanel]]) 
     const h = createLoadHarness(source, name === "content" ? "content" : "sidepanel");
     h.setTab("feed");
     await h.start();
-    assert.equal(h.state.messages[0].includeFeed, true);
-    assert.equal(h.state.pumpCalls, 0);
-    h.setTab("about");
-    await h.start();
-    assert.equal(h.state.messages[1].includeFeed, false);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.state.messages[0].includeFeed, false);
+    assert.equal(h.state.feedCalls, 1);
     assert.equal(h.state.pumpCalls, 0);
     h.setTab("holders");
     const pending = h.start();
     await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(h.state.messages[2].includeFeed, false);
+    assert.equal(h.state.fomoCalls, 1);
     assert.equal(h.state.pumpCalls, 1);
     h.finishPump([]);
     await pending;
   });
 
-  test(`${name} reuses the in-flight holder load and applies its delayed Pump result`, async () => {
+  test(`${name} finishes the base load independently and reuses its delayed Pump result`, async () => {
     const harness = createLoadHarness(source, name === "content" ? "content" : "sidepanel");
     const first = harness.start();
     await new Promise((resolve) => setImmediate(resolve));
     const refresh = harness.start();
-
-    assert.equal(refresh, first);
+    await first;
+    assert.equal(harness.start(), refresh);
     assert.equal(harness.state.fomoCalls, 1);
     assert.equal(harness.state.pumpCalls, 1);
 
     const pumpItem = { platform: "pump", userId: "pump-user" };
     harness.finishPump([pumpItem]);
-    await first;
+    await refresh;
     assert.deepEqual(harness.state.renderedItems, [pumpItem]);
   });
 }

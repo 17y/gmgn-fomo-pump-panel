@@ -918,6 +918,35 @@ function gmgnSupplyReply(request, overrides = {}) {
     symbol: 'RKST', total_supply: '1000000000', decimals: 18, ...overrides }] });
 }
 
+test('GMGN batch metadata adapter sanitizes same-chain rows and cancels its timeout/subscription', async () => {
+  const { h, clock, requests } = gmgnSupplyHarness();
+  const address = trade().tokenAddress;
+  const pending = h.context.__gmgnFollowTokenMetadata('bsc', [address]);
+  assert.equal(requests.length, 1);
+  requests[0].observer.next({ tokens: [
+    { chain: 'bsc', address: address.toUpperCase().replace('0X', '0x'), symbol: 'MEME', total_supply: '1234', price: '999' },
+    { chain: 'sol', address, total_supply: '1000' },
+    { chain: 'bsc', address: '0x2222222222222222222222222222222222222222', total_supply: '1000' },
+  ] });
+  const result = await pending;
+  assert.equal(result.length, 1); assert.equal(result[0].total_supply, 1234);
+  assert.equal(result[0].price, undefined);
+  assert.equal(clock.pending, 0);
+  assert.equal(requests[0].addresses.length, 1);
+});
+
+test('GMGN batch metadata rejects unsupported/oversized input and releases hung queries in six seconds', async () => {
+  const { h, clock, requests } = gmgnSupplyHarness();
+  for (const [chain, addresses] of [['unknown', [trade().tokenAddress]], ['bsc', Array(51).fill(trade().tokenAddress)], ['bsc', ['bad']]]) {
+    assert.equal((await h.context.__gmgnFollowTokenMetadata(chain, addresses)).length, 0);
+  }
+  assert.equal(requests.length, 0);
+  const pending = h.context.__gmgnFollowTokenMetadata('bsc', [trade().tokenAddress]);
+  await clock.advance(6000);
+  assert.equal(await pending, null);
+  assert.equal(clock.pending, 0);
+});
+
 test('GMGN 原生资料补齐 RKST 市值：供应量已是人类单位，不改变成交字段或重复声音', async () => {
   const {h, clock, requests} = gmgnSupplyHarness();
   const item = trade({platform: 'pump', networkId: 4663, totalSupply: null,

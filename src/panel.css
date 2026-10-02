@@ -262,7 +262,7 @@ body.side-panel-page {
 .fomo-tabs {
   position: relative;
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(2, 1fr);
   border-bottom: 1px solid #201e29;
 }
 
@@ -703,69 +703,6 @@ body.side-panel-page {
   color: #dedde2;
   font-size: 16px;
   font-variant-numeric: tabular-nums;
-}
-
-.fomo-about {
-  padding: 20px 16px 26px;
-}
-
-.fomo-about h2 {
-  margin: 0;
-  color: #f7f7f7;
-  font-size: 18px;
-  font-weight: 700;
-}
-
-.fomo-about-description {
-  margin: 9px 0 18px;
-  color: #aaa8b1;
-  font-size: 14px;
-  line-height: 1.5;
-  white-space: pre-wrap;
-}
-
-.fomo-about-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-}
-
-.fomo-about-stat {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  min-width: 0;
-  padding: 11px 12px;
-  border: 1px solid #24212c;
-  border-radius: 10px;
-  background: #0e0b14;
-}
-
-.fomo-about-stat span {
-  color: #66636d;
-  font-size: 12px;
-  text-transform: capitalize;
-}
-
-.fomo-about-stat strong {
-  overflow: hidden;
-  color: #f0eff2;
-  font-size: 14px;
-  font-weight: 500;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.fomo-about-details {
-  display: grid;
-  gap: 7px;
-  margin-top: 14px;
-}
-
-.fomo-about-details .fomo-about-stat {
-  flex-direction: row;
-  align-items: center;
-  justify-content: space-between;
 }
 
 .fomo-socials {
