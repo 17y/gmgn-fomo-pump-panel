@@ -1,7 +1,7 @@
 (function installGmgnFollowEventRelay() {
   "use strict";
 
-  const RELAY_VERSION = "1.0.7";
+  const RELAY_VERSION = "1.0.8";
   const MESSAGE_CHANNEL = "gmgn-follow-trade-event-v1";
   const RECONNECT_DELAYS_MS = Object.freeze([1_000, 2_000, 5_000]);
   const PLATFORM_IMAGE_SELECTOR = 'img[src*="gmgn-follow-source"]';
