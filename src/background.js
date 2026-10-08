@@ -693,14 +693,17 @@ function updateFomoSession(patch) {
     const authorizationChanged = Boolean(
       patch?.authorization && patch.authorization !== previousSession.authorization,
     );
-    if (authorizationChanged) {
+    const chainsChanged = Object.hasOwn(patch, "supportedChains")
+      && patch.supportedChains !== previousSession.supportedChains;
+    const sessionChanged = authorizationChanged || chainsChanged;
+    if (sessionChanged) {
       holderFollowSnapshot = null;
       detailVisitsByTab.clear();
       fomoReadCache.clear();
       fomoReadFailures.clear();
     }
     await chrome.storage.local.set({ [SESSION_KEY]: nextSession });
-    if (authorizationChanged) await notifyFomoSessionChanged();
+    if (sessionChanged) await notifyFomoSessionChanged();
     return nextSession;
   });
   fomoSessionWritePromise = write.catch(() => {});
@@ -712,7 +715,7 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
     if (details.initiator !== FOMO_PAGE_ORIGIN) return;
     const authorization = headerValue(details.requestHeaders, "authorization");
     if (!authorization) {
-      captureFomoPageSession(details.tabId).catch(() => {});
+      captureFomoPageSession(details.tabId, headerValue(details.requestHeaders, "x-supported-chains")).catch(() => {});
       return;
     }
     updateFomoSession({
@@ -725,7 +728,7 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
   ["requestHeaders", "extraHeaders"],
 );
 
-function captureFomoPageSession(tabId) {
+function captureFomoPageSession(tabId, supportedChains = null) {
   if (!Number.isInteger(tabId) || tabId < 0) return Promise.resolve(null);
   if (fomoPageSessionCaptures.has(tabId)) return fomoPageSessionCaptures.get(tabId);
   // Cookie-mode page requests no longer expose Authorization. Read only the
@@ -745,7 +748,7 @@ function captureFomoPageSession(tabId) {
       const payload = JSON.parse(atob(jwt.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
       if (!Number.isFinite(payload.exp) || payload.exp * 1_000 <= Date.now()) return null;
     } catch { return null; }
-    const session = await updateFomoSession({ authorization: `Bearer ${jwt}`, updatedAt: Date.now() });
+    const session = await updateFomoSession({ authorization: `Bearer ${jwt}`, supportedChains: supportedChains || DEFAULT_SUPPORTED_CHAINS, updatedAt: Date.now() });
     ensureFomoAlertSocket().catch(() => {});
     return session;
   }).finally(() => {

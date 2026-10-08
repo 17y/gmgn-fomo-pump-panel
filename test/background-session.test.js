@@ -156,6 +156,7 @@ function createHarness({
   const gmgnMetadataRequests = [];
   const fomoBodies = [];
   const requestedAuthorizations = [];
+  const requestedSupportedChains = [];
   const requestedUrls = [];
   const requestedRpcUrls = [];
   const requestedRpcPayloads = [];
@@ -546,6 +547,7 @@ function createHarness({
       }
       const authorization = options.headers.authorization;
       requestedAuthorizations.push(authorization);
+      requestedSupportedChains.push(options.headers["x-supported-chains"]);
       const status = responseStatus(authorization, _url);
       return {
         ok: status >= 200 && status < 300,
@@ -984,6 +986,7 @@ function createHarness({
     fomoPageReadScripts,
     setFomoPageToken(value) { fomoPageToken = value; },
     requestedAuthorizations,
+    requestedSupportedChains,
     pumpRequestCredentials,
     pumpRequestMethods,
     requestedRpcPayloads,
@@ -1210,7 +1213,7 @@ test("读取失败不清除正常会话，并释放并发读取供下次重试",
   assert.equal(h.localRemoveCalls.includes(SESSION_KEY), false);
 });
 
-test("读取同一 Cookie 会话保留缓存和连接，新令牌才通知刷新", async () => {
+test("读取相同令牌和链范围保留缓存和连接，新令牌才通知刷新", async () => {
   const jwt = fomoPageJwt();
   const h = createHarness({ initialAuthorization: `Bearer ${jwt}`, fomoPageToken: jwt, responseStatus: () => 200 });
   await h.query();
@@ -1220,17 +1223,64 @@ test("读取同一 Cookie 会话保留缓存和连接，新令牌才通知刷新
   socket.open(); socket.receive({ type: "challengeAccepted" });
   await new Promise(setImmediate);
   const requestsBefore = h.fomoRequestCount();
-  await h.runtimeContext.captureFomoPageSession(71);
+  await h.runtimeContext.captureFomoPageSession(71, "1,56");
   await h.query();
   assert.equal(h.webSockets.length, 1);
   assert.equal(h.webSockets[0], socket);
   assert.equal(h.fomoRequestCount(), requestsBefore, "同一会话不增加读取或清空缓存");
   assert.equal(h.runtimeMessages.filter(m => m.type === "fomoSessionChanged").length, 0);
   h.setFomoPageToken(fomoPageJwt(undefined, "new-viewer"));
-  await h.runtimeContext.captureFomoPageSession(71);
+  await h.runtimeContext.captureFomoPageSession(71, "1,56");
   await h.query();
   assert.equal(h.runtimeMessages.filter(m => m.type === "fomoSessionChanged").length, 1);
   port.disconnect();
+});
+
+test("Cookie 请求同步链范围：同一令牌解除 Solana 过滤并重试当前详情", async () => {
+  const jwt = fomoPageJwt();
+  const chains = "1,56,143,4663,5042,8453,1399811149";
+  const h = createHarness({ initialAuthorization: `Bearer ${jwt}`, fomoPageToken: jwt,
+    responseStatus: () => 200, gmgnVisitId: "solana-document", responsePayload: () => ({
+      metadata: h.requestedSupportedChains.at(-1).includes("1399811149") ? { name: "Solana", totalSupply: 1_000 } : null,
+    }) });
+  h.runtimeContext.GmgnFomoApi.sanitizeMetadata = payload => payload.metadata;
+  const params = { address: "HaQdrXRUoxxk1qLFZJNrSyzWNjn16o1r1np5h6jipump", networkId: core.TOKEN_NETWORK_IDS.sol };
+  const request = { type: "queryFomoToken", params, tabId: 99, oncePerVisit: true, includeFeed: false };
+  assert.equal((await h.message(request)).error, "TOKEN_NOT_FOUND");
+  const port = h.connectGmgnTradeEvents();
+  await new Promise(setImmediate);
+  const socket = h.webSockets[0];
+  socket.open(); socket.receive({ type: "challengeAccepted" });
+  h.requestHeaderListener({ initiator: "https://fomo.family", tabId: 71,
+    requestHeaders: [{ name: "X-Supported-Chains", value: chains }] });
+  await h.runtimeContext.captureFomoPageSession(71, chains);
+  assert.equal(h.localData[SESSION_KEY].authorization, `Bearer ${jwt}`);
+  assert.equal(h.localData[SESSION_KEY].supportedChains, chains);
+  assert.equal(h.runtimeMessages.filter(m => m.type === "fomoSessionChanged").length, 1);
+  const result = await h.message(request);
+  assert.equal(result.ok, true);
+  assert.equal(result.data.metadata.name, "Solana");
+  assert.equal(h.requestedSupportedChains.at(-1), chains);
+  await h.runtimeContext.captureFomoPageSession(71);
+  assert.equal(h.runtimeMessages.filter(m => m.type === "fomoSessionChanged").length, 1, "缺省链范围与全部链范围相同时不重复刷新");
+  assert.equal(h.webSockets.length, 1, "链范围变化不得重建正常的实时连接");
+  assert.equal(h.webSockets[0], socket);
+  assert.equal(h.createdTabCount(), 0);
+  port.disconnect();
+});
+
+test("Cookie 请求未提供链范围时清除旧范围并使用全部支持链", async () => {
+  const jwt = fomoPageJwt();
+  const h = createHarness({ initialAuthorization: `Bearer ${jwt}`, fomoPageToken: jwt, responseStatus: () => 200 });
+  h.requestHeaderListener({ initiator: "https://fomo.family", tabId: 71, requestHeaders: [] });
+  await h.runtimeContext.captureFomoPageSession(71);
+  assert.equal(h.localData[SESSION_KEY].supportedChains, "1,56,143,4663,5042,8453,1399811149");
+  assert.equal((await h.query()).ok, true);
+  assert.ok(h.requestedSupportedChains.every(chains => chains.includes("1399811149")));
+  const messagesBefore = h.runtimeMessages.length;
+  await h.runtimeContext.captureFomoPageSession(71);
+  assert.equal(h.runtimeMessages.length, messagesBefore, "相同默认链范围不重复通知刷新");
+  assert.equal(h.localRemoveCalls.includes(SESSION_KEY), false);
 });
 
 test("页面读取在导航后拒绝异站，只读访问令牌而不读取刷新令牌", async () => {
