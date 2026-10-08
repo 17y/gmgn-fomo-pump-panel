@@ -79,6 +79,10 @@ function createHarness({
   backoffState = null,
   tokenAwareRequests = false,
   replacementAuthorization = null,
+  fomoPageToken = null,
+  replacementFomoPageToken = null,
+  fomoPageReadError = false,
+  fomoPageReadDelayMs = 0,
   pumpStatus = 200,
   pumpPresenceStatus = null,
   updateSessionRules = async () => {},
@@ -168,6 +172,8 @@ function createHarness({
   let createdTabCount = 0;
   let pumpSessionOpened = false;
   let fomoRequestCount = 0;
+  let fomoPageReadCount = 0;
+  const fomoPageReadScripts = [];
   let pumpRequestCount = 0;
   let pumpPageRequestCount = 0;
   let gmgnRequestCount = 0;
@@ -600,6 +606,13 @@ function createHarness({
     },
     scripting: {
       async executeScript(details) {
+        if (String(details?.func).includes('privy:token')) {
+          fomoPageReadCount += 1;
+          fomoPageReadScripts.push(details);
+          if (fomoPageReadDelayMs) await new Promise(resolve => setTimeout(resolve, fomoPageReadDelayMs));
+          if (fomoPageReadError) throw new Error("TAB_CLOSED");
+          return [{ result: fomoPageToken }];
+        }
         if (String(details?.func).includes("__gmgnFomoDetailVisit")) return [{ result: gmgnVisitId }];
         if (String(details?.func).includes("__gmgnFollowTokenMetadata")) {
           const [chain, addresses] = details.args;
@@ -673,6 +686,10 @@ function createHarness({
             requestHeaders: [{ name: "authorization", value: replacementAuthorization }],
           });
           await Promise.resolve();
+        }
+        if (replacementFomoPageToken && String(details.url || "").startsWith("https://fomo.family/")) {
+          fomoPageToken = replacementFomoPageToken;
+          requestHeaderListener({ initiator: "https://fomo.family", tabId: tab.id, requestHeaders: [] });
         }
         return tab;
       },
@@ -963,6 +980,9 @@ function createHarness({
     releaseGmgn,
     removedTabIds,
     requestHeaderListener,
+    fomoPageReadCount: () => fomoPageReadCount,
+    fomoPageReadScripts,
+    setFomoPageToken(value) { fomoPageToken = value; },
     requestedAuthorizations,
     pumpRequestCredentials,
     pumpRequestMethods,
@@ -1110,6 +1130,123 @@ test("扩展自己的 API 请求不会覆盖 Fomo 页面会话", async () => {
   await Promise.resolve();
 
   assert.equal(harness.localData[SESSION_KEY].authorization, "page-token");
+});
+
+function fomoPageJwt(exp = Math.floor(Date.now() / 1_000) + 3_600, id = "viewer") {
+  return `header.${Buffer.from(JSON.stringify({ exp, sub: id })).toString("base64url")}.signature`;
+}
+
+test("Fomo Cookie 页面请求从页面访问令牌恢复持仓读取和实时订阅", async () => {
+  const jwt = fomoPageJwt();
+  const h = createHarness({ fomoPageToken: jwt, responseStatus: () => 200 });
+  assert.equal((await h.query()).error, "FOMO_NOT_CONNECTED");
+  h.requestHeaderListener({ initiator: "https://fomo.family", tabId: 71, requestHeaders: [] });
+  await new Promise(setImmediate);
+  assert.equal(h.localData[SESSION_KEY].authorization, `Bearer ${jwt}`);
+  assert.equal((await h.query()).ok, true);
+  assert.ok(h.requestedAuthorizations.every(auth => auth === `Bearer ${jwt}`));
+  assert.equal(h.createdTabCount(), 0);
+  assert.ok(h.runtimeMessages.some(message => message.type === "fomoSessionChanged"));
+  const port = h.connectGmgnTradeEvents();
+  await new Promise(setImmediate);
+  const socket = h.webSockets[0];
+  socket.open();
+  assert.equal(socket.sent[0].jwt, jwt);
+  socket.receive({ type: "challengeAccepted" });
+  assert.equal(socket.sent[1].topicId, "viewer-user");
+  port.disconnect();
+});
+
+test("Cookie 页面续期继续复用原有 401 恢复和请求去重", async () => {
+  const jwt = fomoPageJwt();
+  const h = createHarness({ initialAuthorization: "expired", replacementFomoPageToken: jwt,
+    responseStatus: auth => auth === `Bearer ${jwt}` ? 200 : 401 });
+  assert.equal((await h.query()).error, "FOMO_SESSION_REFRESHING");
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.equal(h.localData[SESSION_KEY].authorization, `Bearer ${jwt}`);
+  assert.equal((await h.query()).ok, true);
+  assert.equal(h.createdTabCount(), 1);
+  assert.deepEqual(h.removedTabIds, [73]);
+  assert.equal(h.fomoRequestCount(), 6);
+});
+
+test("Cookie 会话读取只处理 Fomo 页面请求，并发请求共用一次读取", async () => {
+  const h = createHarness({ fomoPageToken: fomoPageJwt(), responseStatus: () => 200, fomoPageReadDelayMs: 10 });
+  for (const details of [
+    { initiator: "chrome-extension://extension-id", tabId: 71 },
+    { initiator: "https://fomo.family.evil.example", tabId: 71 },
+    { initiator: "https://gmgn.ai", tabId: 71 },
+    { initiator: "https://fomo.family", tabId: -1 },
+    { initiator: "https://fomo.family" },
+  ]) h.requestHeaderListener({ ...details, requestHeaders: [] });
+  assert.equal(h.fomoPageReadCount(), 0);
+  const details = { initiator: "https://fomo.family", tabId: 71, requestHeaders: [] };
+  for (let i = 0; i < 20; i++) h.requestHeaderListener(details);
+  await h.runtimeContext.captureFomoPageSession(71);
+  assert.equal(h.fomoPageReadCount(), 1);
+  assert.equal(h.fomoPageReadScripts[0].target.tabId, 71);
+  assert.equal(h.fomoRequestCount(), 0, "捕获会话不新增 API 请求");
+});
+
+test("Cookie 会话拒绝过期或无效令牌，并保留当前正常业务会话", async () => {
+  const h = createHarness({ initialAuthorization: "stable", responseStatus: () => 200 });
+  for (const value of [null, {}, "", "not-jwt", "a.b.c\r\nInjected: value", "a.b.c",
+    `${"a".repeat(16_384)}.b.c`, fomoPageJwt(1),
+    `header.${Buffer.from('{}').toString('base64url')}.signature`,
+  ]) {
+    h.setFomoPageToken(value);
+    assert.equal(await h.runtimeContext.captureFomoPageSession(71), null);
+    assert.equal(h.localData[SESSION_KEY].authorization, "stable");
+  }
+  assert.equal(h.localSetCalls.some(values => values[SESSION_KEY]), false);
+  assert.equal(h.createdTabCount(), 0);
+});
+
+test("读取失败不清除正常会话，并释放并发读取供下次重试", async () => {
+  const h = createHarness({ initialAuthorization: "stable", responseStatus: () => 200, fomoPageReadError: true });
+  for (let i = 0; i < 2; i++) await assert.rejects(h.runtimeContext.captureFomoPageSession(71), /TAB_CLOSED/);
+  assert.equal(h.fomoPageReadCount(), 2);
+  assert.equal(h.localData[SESSION_KEY].authorization, "stable");
+  assert.equal(h.localRemoveCalls.includes(SESSION_KEY), false);
+});
+
+test("读取同一 Cookie 会话保留缓存和连接，新令牌才通知刷新", async () => {
+  const jwt = fomoPageJwt();
+  const h = createHarness({ initialAuthorization: `Bearer ${jwt}`, fomoPageToken: jwt, responseStatus: () => 200 });
+  await h.query();
+  const port = h.connectGmgnTradeEvents();
+  await new Promise(setImmediate);
+  const socket = h.webSockets[0];
+  socket.open(); socket.receive({ type: "challengeAccepted" });
+  await new Promise(setImmediate);
+  const requestsBefore = h.fomoRequestCount();
+  await h.runtimeContext.captureFomoPageSession(71);
+  await h.query();
+  assert.equal(h.webSockets.length, 1);
+  assert.equal(h.webSockets[0], socket);
+  assert.equal(h.fomoRequestCount(), requestsBefore, "同一会话不增加读取或清空缓存");
+  assert.equal(h.runtimeMessages.filter(m => m.type === "fomoSessionChanged").length, 0);
+  h.setFomoPageToken(fomoPageJwt(undefined, "new-viewer"));
+  await h.runtimeContext.captureFomoPageSession(71);
+  await h.query();
+  assert.equal(h.runtimeMessages.filter(m => m.type === "fomoSessionChanged").length, 1);
+  port.disconnect();
+});
+
+test("页面读取在导航后拒绝异站，只读访问令牌而不读取刷新令牌", async () => {
+  const h = createHarness({ fomoPageToken: fomoPageJwt(), responseStatus: () => 200 });
+  await h.runtimeContext.captureFomoPageSession(71);
+  const { func, args } = h.fomoPageReadScripts[0];
+  const keys = [];
+  const context = { location: { origin: "https://gmgn.ai" }, localStorage: {
+    getItem(key) { keys.push(key); return JSON.stringify("access-token"); },
+  } };
+  const script = `(${func})(${JSON.stringify(args[0])})`;
+  assert.equal(vm.runInNewContext(script, context), null);
+  assert.deepEqual(keys, []);
+  context.location.origin = "https://fomo.family";
+  assert.equal(vm.runInNewContext(script, context), "access-token");
+  assert.deepEqual(keys, ["privy:token"]);
 });
 
 test("403 不再清除会话或强制打开 Fomo", async () => {
