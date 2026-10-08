@@ -112,6 +112,7 @@ const fomoReadCache = new Map();
 const fomoReadFailures = new Map();
 let pumpPresenceOriginRulePromise = null;
 let fomoSessionWritePromise = Promise.resolve();
+const fomoPageSessionCaptures = new Map();
 let tokenCacheWritePromise = null;
 const tokenCachePendingWrites = new Map();
 let creatingOffscreenDocument = null;
@@ -710,7 +711,10 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
     if (details.initiator !== FOMO_PAGE_ORIGIN) return;
     const authorization = headerValue(details.requestHeaders, "authorization");
-    if (!authorization) return;
+    if (!authorization) {
+      captureFomoPageSession(details.tabId).catch(() => {});
+      return;
+    }
     updateFomoSession({
       authorization,
       supportedChains: headerValue(details.requestHeaders, "x-supported-chains"),
@@ -720,6 +724,36 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
   { urls: ["https://prod-api.fomo.family/*"] },
   ["requestHeaders", "extraHeaders"],
 );
+
+function captureFomoPageSession(tabId) {
+  if (!Number.isInteger(tabId) || tabId < 0) return Promise.resolve(null);
+  if (fomoPageSessionCaptures.has(tabId)) return fomoPageSessionCaptures.get(tabId);
+  // Cookie-mode page requests no longer expose Authorization. Read only the
+  // access token already used by Fomo's SDK, in that request's own page.
+  const capture = chrome.scripting.executeScript({
+    target: { tabId },
+    func: (origin) => {
+      if (location.origin !== origin) return null;
+      try { return JSON.parse(localStorage.getItem("privy:token")); } catch { return null; }
+    },
+    args: [FOMO_PAGE_ORIGIN],
+  }).then(async (results) => {
+    const jwt = results?.[0]?.result;
+    if (typeof jwt !== "string" || jwt.length > 16_384
+      || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(jwt)) return null;
+    try {
+      const payload = JSON.parse(atob(jwt.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+      if (!Number.isFinite(payload.exp) || payload.exp * 1_000 <= Date.now()) return null;
+    } catch { return null; }
+    const session = await updateFomoSession({ authorization: `Bearer ${jwt}`, updatedAt: Date.now() });
+    ensureFomoAlertSocket().catch(() => {});
+    return session;
+  }).finally(() => {
+    if (fomoPageSessionCaptures.get(tabId) === capture) fomoPageSessionCaptures.delete(tabId);
+  });
+  fomoPageSessionCaptures.set(tabId, capture);
+  return capture;
+}
 
 chrome.webRequest.onCompleted?.addListener((details) => {
   if (details.initiator !== "https://pump.fun" || details.statusCode < 200 || details.statusCode >= 300
